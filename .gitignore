@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Logs
+*.log
+streamlit_debug.log
+
+# Operating System
+.DS_Store
+Thumbs.db
+
+# Model weights & ONNX exports (heavy binary files)
+defect_detection_huggingface/output/model/*.safetensors
+defect_detection_huggingface/output/*.onnx*
