@@ -4,10 +4,17 @@ from pathlib import Path
 # Thư mục gốc của project
 PROJECT_DIR = Path(__file__).resolve().parent
 
-# Thư mục dữ liệu (kế thừa từ thư mục đã có trong workspace)
-WORKSPACE_DIR = PROJECT_DIR.parent
-DATA_DIR = WORKSPACE_DIR / "training_images" / "labeled"
-RAW_DATA_DIR = WORKSPACE_DIR / "raw_images"
+# ─────────────────────────────────────────────────────────────
+# ĐƯỜNG DẪN DỮ LIỆU
+# Tất cả đường dẫn đều relative so với PROJECT_DIR để hoạt động
+# đúng trên mọi máy khi clone từ GitHub.
+# ─────────────────────────────────────────────────────────────
+
+# Thư mục dữ liệu training (nằm trong project)
+DATA_DIR = PROJECT_DIR / "data" / "training_images" / "labeled"
+
+# Thư mục ảnh gốc để test inference (nằm trong project)
+RAW_DATA_DIR = PROJECT_DIR / "data" / "raw_images"
 
 # Thư mục kết quả đầu ra
 OUTPUT_DIR = PROJECT_DIR / "output"

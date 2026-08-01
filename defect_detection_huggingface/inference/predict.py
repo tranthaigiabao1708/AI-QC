@@ -62,7 +62,7 @@ class QualityInspector:
             logger.warning(f"Không tìm thấy mô hình đã huấn luyện tại: {model_dir}!")
             logger.warning(f"Tải mô hình gốc (chưa tinh chỉnh) từ Hugging Face Hub: {config.MODEL_NAME}...")
             self.image_processor = AutoImageProcessor.from_pretrained(config.MODEL_NAME)
-            self.model = AutoModelForImageClassification.from_pretrained(config.MODEL_NAME, num_labels=2)
+            self.model = AutoModelForImageClassification.from_pretrained(config.MODEL_NAME, num_labels=2, ignore_mismatched_sizes=True)
             self.model.to(self.device)
             self.model.eval()
 
