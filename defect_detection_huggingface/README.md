@@ -1,130 +1,177 @@
 # 🔍 Hệ Thống Nhận Diện Sản Phẩm Lỗi — Computer Vision (Hugging Face + PyTorch)
 
-Dự án này là một hệ thống kiểm tra chất lượng sản phẩm tự động (Quality Control) được xây dựng theo định hướng học tập và thực hành của một **AI Engineer**. Hệ thống sử dụng kết hợp giữa **Computer Vision truyền thống (OpenCV)** để tiền xử lý/cắt vùng đặc trưng (ROI) và **Deep Learning (Hugging Face + PyTorch)** để phân loại lỗi sản phẩm (OK/NG).
+Dự án này là một hệ thống kiểm tra chất lượng sản phẩm **cos đồng crimping** tự động (Quality Control) sử dụng kết hợp **Computer Vision truyền thống (OpenCV)** để tiền xử lý/cắt vùng đặc trưng (ROI) và **Deep Learning (Hugging Face + PyTorch)** để phân loại lỗi sản phẩm (OK/NG).
+
+**Tính năng nổi bật:**
+- ✅ Pipeline 6 bước bền vững — hoạt động với mọi góc camera (K-means + multi-colorspace fusion)
+- ✅ Nhận diện live từ camera ở 20fps (multi-thread, temporal smoothing, OSD overlay)
+- ✅ Web dashboard Streamlit tương tác
+- ✅ Hỗ trợ ONNX Runtime tăng tốc inference
 
 ---
 
-## 🎯 Định Hướng Lập Trình: AI Engineer vs. Machine Learning Researcher
+## 🚀 Clone Về Máy Khác & Chạy Ngay
 
-*   **Lập trình thực tế**: Thay vì thiết kế một kiến trúc mạng nơ-ron tích chập (Custom CNN) từ đầu và huấn luyện trên dữ liệu cục bộ từ số không (đòi hỏi hàng nghìn ảnh và sức mạnh tính toán khổng lồ), một **AI Engineer** tập trung vào việc **tận dụng tài nguyên có sẵn**:
-    *   Tải mô hình đã huấn luyện trước (**Pre-trained Models**) trên hàng triệu ảnh từ thư viện **Hugging Face Hub**.
-    *   Sử dụng phương pháp **Transfer Learning (Học chuyển giao)**: đóng băng phần thân của mô hình và chỉ huấn luyện lại phân lớp cuối cùng (**classification head**) cho bài toán cụ thể.
-    *   Kế thừa và tích hợp các pipeline tiền xử lý ảnh OpenCV đã được tối ưu hóa.
-    *   Xây dựng hệ thống hoàn chỉnh từ Tiền xử lý -> Huấn luyện -> Suy luận -> Triển khai Dashboard Web.
+### Bước 1: Clone repository
 
----
-
-## 🤖 Báo Cáo Tự Học: Lựa Chọn Mô Hình & Các Giải Pháp Thay Thế
-
-Dự án này mặc định sử dụng mô hình **ResNet-18** (`microsoft/resnet-18`) của Microsoft thông qua Hugging Face. Dưới đây là lý do lựa chọn và so sánh chi tiết với các kiến trúc khác:
-
-### 1. Lý do chọn ResNet-18 làm mô hình mặc định:
-*   **Hiệu quả truyền tải đặc trưng**: Mạng ResNet sử dụng các khối kết nối tắt (Skip Connections) giúp giải quyết triệt để lỗi triệt tiêu gradient (vanishing gradient) khi mô hình sâu hơn. ResNet-18 dù nông nhưng vẫn trích xuất cực tốt các đặc trưng về hình học, kết cấu bề mặt, và màu sắc của cos đồng.
-*   **Tối ưu tài nguyên CPU**: Trong môi trường tự học trên máy cá nhân không có GPU rời, việc huấn luyện và chạy suy luận của ResNet-18 cực kỳ nhanh và mượt mà, không xảy ra hiện tượng tràn bộ nhớ RAM/VRAM.
-*   **Kháng Overfitting trên tập dữ liệu nhỏ**: Do tập dữ liệu mẫu chỉ gồm 3 ảnh OK và 3 ảnh NG, các mô hình lớn rất dễ bị "thuộc lòng" dữ liệu (overfit). ResNet-18 có kích thước tham số nhỏ (~11 triệu tham số), kết hợp với kỹ thuật đóng băng trọng số, sẽ giúp mô hình có khả năng tổng quát hóa tốt hơn nhiều.
-
-### 2. Các mô hình thay thế có thể sử dụng:
-
-Bạn có thể thay đổi mô hình dễ dàng bằng cách đổi tên trong tệp `config.py`:
-
-| Mô hình | Model ID trên Hugging Face | Số lượng tham số | Ưu điểm chính | Nhược điểm / Hạn chế |
-| :--- | :--- | :--- | :--- | :--- |
-| **ResNet-18** *(Đang chọn)* | `microsoft/resnet-18` | ~11M | Cực kỳ nhẹ, chạy mượt trên CPU, huấn luyện siêu nhanh, khó bị overfit khi ít dữ liệu. | Độ chính xác tối đa thấp hơn các dòng Transformer trên các bài toán phức tạp cao. |
-| **Vision Transformer (ViT)** | `google/vit-tiny-patch16-224` | ~5.7M | Hiểu mối quan hệ không gian toàn cục của ảnh bằng cơ chế Self-Attention. | Huấn luyện chậm trên CPU, rất dễ bị overfit nếu dữ liệu huấn luyện quá ít. |
-| **ConvNeXt** | `facebook/convnext-tiny-224` | ~28M | Kiến trúc CNN hiện đại, tích hợp tư duy thiết kế của Transformer. Đạt độ chính xác rất cao. | Nặng hơn ResNet-18, đòi hỏi CPU mạnh hơn một chút. |
-| **MobileNetV2** | `google/mobilenet_v2_1.0_224` | ~3.5M | Siêu nhẹ, thiết kế chuyên biệt cho thiết bị di động và các hệ thống nhúng Edge Devices. | Độ chính xác giảm nhẹ đối với các lỗi sản phẩm tinh vi, khó nhìn. |
-
----
-
-## 🛠️ Quy Trình Pipeline Xử Lý Ảnh (Kết hợp OpenCV + Deep Learning)
-
-Hệ thống kết hợp sức mạnh của thị giác máy tính truyền thống và học sâu qua các bước:
-
-```
-[Ảnh gốc đầu vào] 
-        │
-        ▼ (OpenCV 6 bước tiền xử lý)
-1. Tách nền -> 2. Định biên -> 3. Xoay thẳng -> 4. Cắt chuẩn hóa -> 5. Vùng đồng -> 6. Cắt ROI 
-        │
-        ▼ (Ảnh ROI kích thước 224x224)
-[Hugging Face ImageProcessor] (Chuẩn hóa mean, std, đổi sang RGB Tensor)
-        │
-        ▼ 
-[Mô hình PyTorch Fine-tuned] (Forward Pass tính điểm số Logits)
-        │
-        ▼
-[Bộ phân loại & Áp ngưỡng Threshold] (Đưa ra kết quả cuối cùng OK/NG kèm % độ tin cậy)
-```
-
----
-
-## 📁 Cấu Trúc Thư Mục Dự Án
-
-```
-defect_detection_huggingface/
-├── README.md                 # Hướng dẫn học tập, so sánh mô hình và cách chạy
-├── requirements.txt         # Khai báo các thư viện phụ thuộc (numpy<2, torch, transformers, ...)
-├── config.py                 # Cấu hình tập trung (Model ID, Learning Rate, Epoch, Paths)
-├── run_demo.bat             # File thực thi tương tác CLI (Cài đặt, Huấn luyện, Suy luận, Web App)
-├── run_app.bat              # File chạy trực tiếp Dashboard Streamlit bằng 1-click
-│
-├── preprocessing/            # Pipeline OpenCV trích xuất ROI sản phẩm
-│   ├── __init__.py
-│   └── image_processor.py    # Class xử lý ảnh 6 bước
-│
-├── training/                 # Mã nguồn huấn luyện
-│   ├── __init__.py
-│   ├── dataset.py            # Dataset PyTorch + Data Augmentation động + HF ImageProcessor
-│   └── train_hf.py           # Tinh chỉnh (Fine-tuning) mô hình pre-trained bằng PyTorch
-│
-├── inference/                # Mã nguồn chạy thực tế
-│   ├── __init__.py
-│   └── predict.py            # Dự đoán ảnh gốc: OpenCV + Hugging Face Model
-│
-└── app.py                    # Giao diện Web Dashboard trực quan bằng Streamlit
-```
-
----
-
-## 🚀 Cài Đặt & Sử Dụng
-
-### Cách 1: Sử dụng File Chạy Tiện Ích `run_demo.bat` (Khuyến nghị)
-Bạn chỉ cần click đúp vào file `run_demo.bat` trên Windows, một menu tương tác bằng tiếng Việt sẽ hiện ra giúp bạn thực hiện mọi thao tác:
-1. Nhấn `4` để tự động cài đặt các thư viện cần thiết.
-2. Nhấn `1` để bắt đầu huấn luyện tinh chỉnh mô hình Hugging Face.
-3. Nhấn `2` để chạy suy luận thử nghiệm trên các ảnh gốc.
-4. Nhấn `3` để mở Dashboard Web Streamlit.
-
----
-
-### Cách 2: Chạy trực tiếp bằng dòng lệnh (Dùng command `py` cho Windows)
-
-Môi trường hiện tại sử dụng công cụ quản lý Python `py`. Dưới đây là các câu lệnh chạy thủ công:
-
-#### 1. Cài đặt các thư viện phụ thuộc:
 ```bash
+git clone https://github.com/tranthaigiabao1708/AI-QC.git
+cd AI-QC/defect_detection_huggingface
+```
+
+### Bước 2: Cài đặt thư viện
+
+```bash
+# Khuyến nghị dùng Python 3.10 - 3.12
 py -m pip install -r requirements.txt
 ```
-*(requirements.txt đã được khóa phiên bản `numpy<2` để tránh xung đột với OpenCV trên Windows).*
 
-#### 2. Huấn luyện mô hình:
+> **Lưu ý:** Lần đầu chạy, hệ thống sẽ tự động tải model `microsoft/resnet-18` (~44MB) từ Hugging Face Hub. Cần có kết nối Internet.
+
+### Bước 3: Chạy thử inference trên ảnh mẫu
+
 ```bash
+py inference/predict.py
+```
+
+Kết quả sẽ được lưu tại `output/predictions/`.
+
+### Bước 4 (Tùy chọn): Huấn luyện model trên dữ liệu của bạn
+
+```bash
+# 1. Bỏ ảnh sản phẩm OK vào: data/training_images/labeled/OK/
+# 2. Bỏ ảnh sản phẩm NG vào: data/training_images/labeled/NG/
+# 3. Chạy train:
 py training/train_hf.py
 ```
-*Script sẽ tự động đọc các ảnh mẫu trong `training_images/labeled/OK` và `training_images/labeled/NG`, thực hiện tăng cường dữ liệu (Augmentation), huấn luyện lớp phân loại cuối cùng, vẽ đồ thị huấn luyện lưu tại `output/training_curves.png` và lưu model đã fine-tune tại `output/model/`.*
 
-#### 3. Chạy suy luận trên ảnh gốc:
+### Bước 5 (Tùy chọn): Chạy Live Camera Detection
+
 ```bash
-# Chạy suy luận trên toàn bộ ảnh gốc mặc định trong raw_images/
-py inference/predict.py
+# Nhận diện liên tục từ camera USB/webcam
+py live_inspector.py --camera 0 --fps 20 --mode continuous
 
-# Chạy suy luận trên 1 ảnh chỉ định
-py inference/predict.py --image "d:\Cole\AI engineer LV up\raw_images\z7958188267677_5f8ea55ba285f6c7b998bc54ad56b9f5.jpg"
+# Tự động chụp khi sản phẩm ổn định
+py live_inspector.py --camera 0 --mode auto-capture
+
+# Preview live, nhấn Space để trigger phân tích
+py live_inspector.py --camera 0 --mode manual-trigger
 ```
-*Kết quả suy luận trực quan (gồm bounding box bao quanh sản phẩm, nhãn phân loại OK/NG và độ tin cậy) sẽ được lưu tại thư mục `output/predictions/`.*
 
-#### 4. Khởi động Web Dashboard:
+**Phím tắt khi chạy Live:** `q` thoát | `s` screenshot | `Space` trigger | `m` đổi mode
+
+### Bước 6 (Tùy chọn): Mở Web Dashboard
+
 ```bash
 streamlit run app.py
 ```
-*Giao diện dashboard sẽ tự động được mở trong trình duyệt của bạn tại địa chỉ: `http://localhost:8501`. Bạn có thể tải ảnh lên hoặc chọn ảnh mẫu, xem trực quan kết quả tiền xử lý ảnh 6 bước bằng OpenCV cùng kết quả phân loại của mô hình học sâu.*
+
+Trình duyệt sẽ tự mở tại `http://localhost:8501`.
+
+---
+
+## 📁 Cấu Trúc Thư Mục
+
+```
+defect_detection_huggingface/
+├── README.md                  # File này
+├── requirements.txt           # Thư viện phụ thuộc
+├── config.py                  # Cấu hình tập trung (model, paths, thresholds, live camera)
+├── run_demo.bat               # CLI Runner tương tác (Windows)
+├── run_app.bat                # Chạy Streamlit 1-click
+│
+├── data/                      # DỮ LIỆU (ảnh mẫu + training data)
+│   ├── raw_images/            # Ảnh gốc để test inference
+│   └── training_images/
+│       └── labeled/
+│           ├── OK/            # Ảnh sản phẩm đạt chuẩn
+│           └── NG/            # Ảnh sản phẩm lỗi
+│
+├── preprocessing/             # Pipeline OpenCV 6 bước (Robust V2)
+│   ├── __init__.py
+│   └── image_processor.py     # HSV bg removal, PCA rotation, K-means copper detection
+│
+├── training/                  # Huấn luyện model
+│   ├── __init__.py
+│   ├── dataset.py             # Dataset + Data Augmentation (perspective, shear, scale, cutout)
+│   └── train_hf.py            # Fine-tuning ResNet-18 từ Hugging Face
+│
+├── inference/                 # Suy luận
+│   ├── __init__.py
+│   └── predict.py             # QualityInspector (PyTorch + ONNX support)
+│
+├── tools/
+│   └── export_onnx.py         # Xuất model sang ONNX để tăng tốc inference
+│
+├── live_inspector.py          # 📹 Nhận diện live từ camera 20fps (MỚI)
+├── app.py                     # 🌐 Web Dashboard Streamlit (ảnh tĩnh + live camera)
+│
+└── output/                    # Kết quả đầu ra (tự tạo khi chạy)
+    ├── model/                 # Model đã train (safetensors)
+    ├── predictions/           # Ảnh kết quả inference
+    └── ng_captures/           # Ảnh NG tự động capture (live mode)
+```
+
+---
+
+## 🤖 Pipeline Xử Lý Ảnh (Robust V2)
+
+```
+[Ảnh đầu vào (bất kỳ góc camera)]
+        │
+        ▼ (OpenCV 6 bước — Adaptive Pipeline)
+1. Tách nền (HSV blue detection + Otsu)
+2. PCA xác định trục chính
+3. Xoay thẳng + phân tích sáng xác định hướng đầu cos
+4. Cắt adaptive (% chiều dài sản phẩm)
+5. K-means copper detection + multi-colorspace voting (LAB+HSV+YCrCb)
+6. ROI + pipeline confidence scoring
+        │
+        ▼ (ROI 224×224)
+[Hugging Face ImageProcessor] → [ResNet-18 Fine-tuned] → [OK / NG + confidence %]
+```
+
+---
+
+## 🎯 Mô Hình Có Thể Thay Thế
+
+Đổi `MODEL_NAME` trong `config.py`:
+
+| Mô hình | Model ID | Tham số | Ưu điểm |
+| :--- | :--- | :--- | :--- |
+| **ResNet-18** *(mặc định)* | `microsoft/resnet-18` | ~11M | Nhẹ, nhanh trên CPU |
+| **ConvNeXt** | `facebook/convnext-tiny-224` | ~28M | Chính xác cao hơn |
+| **MobileNetV2** | `google/mobilenet_v2_1.0_224` | ~3.5M | Siêu nhẹ, cho edge devices |
+| **ViT** | `google/vit-tiny-patch16-224` | ~5.7M | Transformer-based |
+
+---
+
+## 📹 Live Camera Detection
+
+3 chế độ hoạt động:
+
+| Chế độ | Mô tả | Lệnh |
+|---|---|---|
+| **continuous** | Nhận diện liên tục mọi frame | `py live_inspector.py --mode continuous` |
+| **auto-capture** | Tự động chụp + log khi sản phẩm ổn định | `py live_inspector.py --mode auto-capture` |
+| **manual-trigger** | Preview live, Space để trigger | `py live_inspector.py --mode manual-trigger` |
+
+Tính năng:
+- Multi-thread (camera + processing + display)
+- Temporal smoothing + hysteresis (tránh kết quả nhảy)
+- OSD overlay (bounding box, confidence bar, FPS, statistics)
+- Product tracking (phát hiện sản phẩm mới)
+- Auto-save ảnh NG + CSV log
+
+---
+
+## ⚙️ Cấu Hình Quan Trọng (`config.py`)
+
+| Biến | Mặc định | Mô tả |
+|---|---|---|
+| `CONFIDENCE_THRESHOLD` | 0.70 | Ngưỡng tin cậy phân loại OK/NG |
+| `CROP_RATIO` | 0.45 | Tỷ lệ crop so với chiều dài sản phẩm |
+| `CAMERA_ID` | 0 | ID camera (0 = webcam mặc định) |
+| `TARGET_FPS` | 20 | FPS mục tiêu live mode |
+| `SMOOTHING_WINDOW` | 7 | Số frame dùng cho temporal smoothing |
+| `USE_ONNX` | False | Bật ONNX Runtime tăng tốc |
