@@ -193,70 +193,145 @@ class ImageProcessor:
     # ──────────────────────────────────────────────────────────
     def _step1_remove_background(self, img, h, w):
         """
-        Tách nền bền vững:
-        - Phát hiện nền xanh dương bằng HSV range
-        - Kết hợp Otsu trên grayscale để xử lý trường hợp nền không xanh
-        - Dùng tỷ lệ diện tích thay vì ngưỡng cố định
+        Tách nền đa chiến lược — hoạt động với BẤT KỲ nền nào:
+        1. Phát hiện nền xanh dương (HSV)
+        2. Phát hiện dây trắng + kim loại sáng (LAB lightness + low saturation)
+        3. Edge-based (Canny + morphological) cho nền có texture
+        4. Otsu với blur mạnh (fallback cuối)
+        Chọn chiến lược cho kết quả contour tốt nhất (dài, rõ ràng).
         """
         min_area = int(h * w * self.min_contour_ratio)
-
-        # Chiến lược 1: Phát hiện nền xanh dương bằng HSV
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        # Khoảng HSV rộng cho nền xanh dương (bao phủ nhiều shade)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+
+        candidate_masks = []
+
+        # ── Chiến lược 1: Nền xanh dương ──
         lower_blue = np.array([85, 30, 50])
         upper_blue = np.array([135, 255, 255])
         blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
-
-        # Nếu nền xanh chiếm > 20% ảnh → dùng chiến lược tách nền xanh
         blue_ratio = np.sum(blue_mask > 0) / (h * w)
-        if blue_ratio > 0.20:
-            # Foreground = phần KHÔNG phải nền xanh
-            fg_mask = cv2.bitwise_not(blue_mask)
-        else:
-            # Chiến lược 2: Otsu trên grayscale (fallback cho nền không xanh)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-            _, fg_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if blue_ratio > 0.15:
+            fg1 = cv2.bitwise_not(blue_mask)
+            candidate_masks.append(("blue_bg", fg1))
 
-            # Nếu foreground chiếm quá nhiều → đảo ngược mask
-            fg_ratio = np.sum(fg_mask > 0) / (h * w)
-            if fg_ratio > 0.7:
-                fg_mask = cv2.bitwise_not(fg_mask)
+        # ── Chiến lược 2: Phát hiện dây trắng + kim loại sáng ──
+        # Sản phẩm cos đồng = dây trắng (L cao, S thấp) + đầu kim loại (L cao)
+        l_channel = lab[:, :, 0]       # Lightness
+        s_channel = hsv[:, :, 1]       # Saturation
 
-        # Morphological cleanup mạnh
+        # Vùng sáng VÀ ít màu → dây trắng + kim loại
+        bright_threshold = np.percentile(l_channel, 65)
+        low_sat_threshold = np.percentile(s_channel, 50)
+        wire_mask = ((l_channel > bright_threshold) & (s_channel < low_sat_threshold)).astype(np.uint8) * 255
+        candidate_masks.append(("wire_detect", wire_mask))
+
+        # ── Chiến lược 3: Edge-based (cho nền có texture) ──
+        blurred_edge = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred_edge, 30, 100)
+        # Nối các edge lại thành vùng kín
+        kernel_edge = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+        edges_closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel_edge, iterations=4)
+        # Fill holes
+        edges_filled = edges_closed.copy()
+        flood_fill_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        cv2.floodFill(edges_filled, flood_fill_mask, (0, 0), 255)
+        edges_filled = cv2.bitwise_not(edges_filled)
+        edges_combined = cv2.bitwise_or(edges_closed, edges_filled)
+        candidate_masks.append(("edge_based", edges_combined))
+
+        # ── Chiến lược 4: Otsu với blur mạnh (fallback) ──
+        blurred_heavy = cv2.GaussianBlur(gray, (21, 21), 0)
+        _, otsu_mask = cv2.threshold(blurred_heavy, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        fg_ratio = np.sum(otsu_mask > 0) / (h * w)
+        if fg_ratio > 0.6:
+            otsu_mask = cv2.bitwise_not(otsu_mask)
+        candidate_masks.append(("otsu_heavy", otsu_mask))
+
+        # ── Đánh giá và chọn chiến lược tốt nhất ──
         kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
         kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_close, iterations=3)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel_open, iterations=2)
 
-        # Tìm contour lớn nhất (không lọc theo aspect ratio hay vị trí)
-        contours, _ = cv2.findContours(
-            fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        best_product = None
+        best_score = -1
+        best_mask = None
+        best_strategy = ""
 
-        # Lọc chỉ theo diện tích tương đối
-        candidates = [c for c in contours if cv2.contourArea(c) > min_area]
+        for name, raw_mask in candidate_masks:
+            # Morphological cleanup
+            cleaned = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel_close, iterations=3)
+            cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel_open, iterations=2)
 
-        if not candidates:
+            contours, _ = cv2.findContours(
+                cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            candidates = [c for c in contours if cv2.contourArea(c) > min_area]
+            if not candidates:
+                continue
+
+            product = max(candidates, key=cv2.contourArea)
+            area = cv2.contourArea(product)
+
+            # Tính aspect ratio để ưu tiên contour dài (giống dây cos)
+            rect = cv2.minAreaRect(product)
+            rect_w, rect_h = rect[1]
+            if min(rect_w, rect_h) > 0:
+                aspect = max(rect_w, rect_h) / min(rect_w, rect_h)
+            else:
+                aspect = 1.0
+
+            area_ratio = area / (h * w)
+
+            # Score: ưu tiên contour dài (aspect > 2), diện tích vừa phải (5-50% ảnh)
+            score = 0.0
+            # Aspect ratio: sản phẩm cos đồng luôn dài → ưu tiên AR > 2
+            if aspect > 2.0:
+                score += min(aspect, 10.0) * 10
+            else:
+                score += aspect * 2
+
+            # Diện tích: ưu tiên 3-40% ảnh
+            if 0.03 < area_ratio < 0.40:
+                score += 50
+            elif 0.01 < area_ratio <= 0.03:
+                score += 20
+            elif area_ratio >= 0.40:
+                score += 10
+
+            if score > best_score:
+                best_score = score
+                best_product = product
+                best_mask = cleaned
+                best_strategy = name
+
+        if best_product is None:
             return None, None, 0.0
 
-        product = max(candidates, key=cv2.contourArea)
-
-        # Tạo mask sạch chỉ chứa sản phẩm
+        # Tạo mask sạch chỉ chứa sản phẩm tốt nhất
         clean_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(clean_mask, [product], -1, 255, thickness=cv2.FILLED)
-
-        # Cleanup mask cuối cùng
+        cv2.drawContours(clean_mask, [best_product], -1, 255, thickness=cv2.FILLED)
         clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
         clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_OPEN, kernel_open)
 
-        # Tính confidence: dựa trên tỷ lệ diện tích sản phẩm (quá nhỏ hoặc quá lớn = thấp)
-        product_ratio = cv2.contourArea(product) / (h * w)
-        conf = min(1.0, product_ratio / 0.05) if product_ratio < 0.05 else \
-               min(1.0, (0.7 - product_ratio) / 0.3) if product_ratio > 0.4 else 1.0
-        conf = max(0.1, conf)
+        # Tính confidence
+        product_ratio = cv2.contourArea(best_product) / (h * w)
+        rect = cv2.minAreaRect(best_product)
+        rect_w, rect_h = rect[1]
+        aspect = max(rect_w, rect_h) / max(min(rect_w, rect_h), 1)
 
-        return clean_mask, product, conf
+        # Sản phẩm lý tưởng: aspect > 3, diện tích 5-30%
+        conf = 0.5
+        if aspect > 3.0:
+            conf += 0.3
+        elif aspect > 2.0:
+            conf += 0.15
+        if 0.05 < product_ratio < 0.30:
+            conf += 0.2
+        conf = max(0.2, min(1.0, conf))
+
+        return clean_mask, best_product, conf
 
     # ──────────────────────────────────────────────────────────
     # Bước 2: Border ngoài + PCA
