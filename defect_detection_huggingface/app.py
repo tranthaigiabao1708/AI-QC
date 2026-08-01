@@ -325,6 +325,10 @@ elif app_mode == "📹 Live Camera":
 
     status_bar = st.empty()
 
+    # Pipeline debug section
+    pipeline_expander = st.expander("⚙️ Debug Pipeline — Xem chi tiết từng bước xử lý ảnh", expanded=True)
+    pipeline_placeholder = pipeline_expander.empty()
+
     # ─── VÒNG LẶP LIVE ───
     if st.session_state.live_running and model_loaded:
         cap = cv2.VideoCapture(camera_id)
@@ -432,6 +436,32 @@ elif app_mode == "📹 Live Camera":
                         except Exception:
                             pass
 
+                    # Cập nhật pipeline steps visualization
+                    if last_result and last_result.get("vis_steps"):
+                        vis_steps = last_result["vis_steps"]
+                        steps_keys = [
+                            ("01_bg_removed", "Bước 1: Tách nền", "Multi-strategy: HSV blue + wire detect + edge + Otsu"),
+                            ("02_contour", "Bước 2: Tìm contour", "PCA trục chính + tâm trọng lực"),
+                            ("03_rotated", "Bước 3: Xoay thẳng", "Xoay + phân tích sáng xác định hướng đầu cos"),
+                            ("04_standardized", "Bước 4: Cắt chuẩn hóa", "Crop adaptive theo % chiều dài sản phẩm"),
+                            ("05_copper_detect", "Bước 5: Vùng đồng lộ", "K-means + multi-colorspace voting"),
+                            ("06_roi_final", "Bước 6: ROI", "Cắt ROI → resize 224×224")
+                        ]
+                        with pipeline_placeholder.container():
+                            for r in range(2):
+                                cols_pipe = st.columns(3)
+                                for c in range(3):
+                                    idx = r * 3 + c
+                                    key, title, desc = steps_keys[idx]
+                                    with cols_pipe[c]:
+                                        st.markdown(f"**{title}**")
+                                        st.caption(desc)
+                                        if key in vis_steps:
+                                            step_rgb = cv2.cvtColor(vis_steps[key], cv2.COLOR_BGR2RGB)
+                                            st.image(step_rgb, use_container_width=True)
+                                        else:
+                                            st.warning("❌ Bước này thất bại")
+
                     # Cập nhật thống kê
                     s = st.session_state.stats
                     stats_placeholder.markdown(
@@ -463,6 +493,32 @@ elif app_mode == "📹 Live Camera":
                 result_banner.success(f"✅ Kết quả cuối: **OK** ({lr['confidence']:.1%})")
             else:
                 result_banner.error(f"❌ Kết quả cuối: **NG** — {decision}")
+
+            # Hiển thị pipeline steps cuối cùng khi đã dừng
+            if lr.get("vis_steps"):
+                vis_steps = lr["vis_steps"]
+                steps_keys = [
+                    ("01_bg_removed", "Bước 1: Tách nền", "Multi-strategy background removal"),
+                    ("02_contour", "Bước 2: Tìm contour", "PCA + tâm trọng lực"),
+                    ("03_rotated", "Bước 3: Xoay thẳng", "Xoay + xác định hướng"),
+                    ("04_standardized", "Bước 4: Cắt chuẩn hóa", "Crop adaptive"),
+                    ("05_copper_detect", "Bước 5: Vùng đồng lộ", "K-means + colorspace voting"),
+                    ("06_roi_final", "Bước 6: ROI", "ROI 224×224")
+                ]
+                with pipeline_placeholder.container():
+                    for r in range(2):
+                        cols_pipe = st.columns(3)
+                        for c in range(3):
+                            idx = r * 3 + c
+                            key, title, desc = steps_keys[idx]
+                            with cols_pipe[c]:
+                                st.markdown(f"**{title}**")
+                                st.caption(desc)
+                                if key in vis_steps:
+                                    step_rgb = cv2.cvtColor(vis_steps[key], cv2.COLOR_BGR2RGB)
+                                    st.image(step_rgb, use_container_width=True)
+                                else:
+                                    st.warning("❌ Bước này thất bại")
 
         s = st.session_state.stats
         if s["total"] > 0:
