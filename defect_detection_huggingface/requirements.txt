@@ -21,3 +21,7 @@ scikit-learn>=1.4.0
 loguru>=0.7.2
 pyyaml>=6.0
 joblib>=1.3.0
+
+# ONNX Runtime (tùy chọn — tăng tốc inference ~2-3x, đặc biệt hữu ích cho live mode)
+# Bỏ comment dòng dưới nếu muốn sử dụng ONNX inference
+# onnxruntime>=1.16.0

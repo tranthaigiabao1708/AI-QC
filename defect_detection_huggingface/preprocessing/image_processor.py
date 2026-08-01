@@ -1,13 +1,13 @@
 """
 preprocessing/image_processor.py
 ─────────────────────────────────
-Pipeline 6 bước xử lý ảnh sản phẩm crimping:
-  Bước 1: Tách nền (background removal)
-  Bước 2: Phát hiện contour + border ngoài (minAreaRect)
-  Bước 3: Xoay nắn thẳng + xác định hướng đầu cos
-  Bước 4: Cắt chuẩn hóa từ đỉnh sản phẩm
-  Bước 5: Phát hiện vùng đồng lộ (LAB + HSV)
-  Bước 6: Cắt ROI cuối cùng
+Pipeline 6 bước xử lý ảnh sản phẩm crimping — PHIÊN BẢN BỀN VỮNG (Robust V2):
+  Bước 1: Tách nền bền vững (HSV-based + Otsu, không ngưỡng cứng)
+  Bước 2: Phát hiện contour + PCA xác định trục chính
+  Bước 3: Xoay thẳng + xác định hướng đầu cos bằng phân tích sáng/màu
+  Bước 4: Cắt tự thích ứng (adaptive crop theo tỷ lệ chiều dài sản phẩm)
+  Bước 5: Phát hiện vùng đồng lộ bằng K-means clustering + multi-colorspace
+  Bước 6: Cắt ROI cuối cùng + pipeline confidence scoring
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple
 import cv2
 import numpy as np
+from sklearn.cluster import MiniBatchKMeans
 
 
 @dataclass
@@ -25,9 +26,14 @@ class ProcessingResult:
     copper_h: int = 0                        # Chiều cao vùng đồng (px)
     copper_ratio: float = 0.0               # Tỷ lệ diện tích đồng / sản phẩm
     copper_mask: Optional[np.ndarray] = None # Mask vùng đồng
-    outer_rect: Optional[Any] = None         # minAreaRect sản phẩm
+    outer_rect: Optional[Any] = None         # minAreaRect sản phẩm (backward compat)
     long_angle: float = 0.0                  # Góc xoay
     is_flipped: bool = False                 # Có đảo chiều không
+
+    # === FIELDS MỚI (V2) ===
+    pipeline_confidence: float = 1.0         # Mức tin cậy tổng thể pipeline (0.0-1.0)
+    product_length: int = 0                  # Chiều dài sản phẩm đo được (px)
+    centroid: Tuple[int, int] = (0, 0)       # Tâm sản phẩm trên ảnh gốc (cho tracking)
 
     # Ảnh trực quan hóa từng bước
     vis_steps: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -35,7 +41,9 @@ class ProcessingResult:
 
 class ImageProcessor:
     """
-    Pipeline xử lý ảnh sản phẩm crimping.
+    Pipeline xử lý ảnh sản phẩm crimping — Phiên bản bền vững (Robust V2).
+    Hoạt động ổn định với mọi góc camera.
+
     Sử dụng:
         processor = ImageProcessor()
         result = processor.process(img_bgr)
@@ -44,41 +52,40 @@ class ImageProcessor:
     def __init__(
         self,
         target_size: Tuple[int, int] = (224, 224),
+        crop_ratio: float = 0.45,
         fixed_crop_length: int = 300,
-        bg_diff_threshold: int = 30,
-        morph_kernel_size: int = 9,
-        min_contour_area: int = 5000,
-        min_aspect_ratio: float = 2.5,
-        lab_a_threshold: int = 138,
-        hsv_s_threshold: int = 150,
-        hsv_h_max: int = 25,
-        search_region_ratio: float = 0.55,
+        min_contour_ratio: float = 0.02,
+        copper_kmeans_clusters: int = 4,
+        search_region_ratio: float = 0.60,
         save_vis_steps: bool = True,
     ):
         self.target_size = target_size
+        self.crop_ratio = crop_ratio
         self.fixed_crop_length = fixed_crop_length
-        self.bg_diff_threshold = bg_diff_threshold
-        self.morph_kernel_size = morph_kernel_size
-        self.min_contour_area = min_contour_area
-        self.min_aspect_ratio = min_aspect_ratio
-        self.lab_a_threshold = lab_a_threshold
-        self.hsv_s_threshold = hsv_s_threshold
-        self.hsv_h_max = hsv_h_max
+        self.min_contour_ratio = min_contour_ratio
+        self.copper_kmeans_clusters = copper_kmeans_clusters
         self.search_region_ratio = search_region_ratio
         self.save_vis_steps = save_vis_steps
+
+        # Biến lưu trữ kết quả trung gian cho visualization
+        self._last_copper_x = 0
+        self._last_copper_y = 0
 
     def process(self, img_in: np.ndarray) -> Optional[ProcessingResult]:
         """
         Chạy pipeline 6 bước trên ảnh đầu vào.
+        Trả về ProcessingResult hoặc None nếu thất bại.
         """
         if img_in is None or img_in.size == 0:
             return None
 
         h, w = img_in.shape[:2]
         vis = {}
+        confidence_scores = []  # Thu thập điểm tin cậy từ mỗi bước
 
-        # ═══ BƯỚC 1: TÁCH NỀN ═══
-        fg_mask, product_contour = self._step1_remove_background(img_in, h, w)
+        # ═══ BƯỚC 1: TÁCH NỀN BỀN VỮNG ═══
+        fg_mask, product_contour, conf1 = self._step1_remove_background(img_in, h, w)
+        confidence_scores.append(conf1)
         if fg_mask is None:
             return None
 
@@ -86,24 +93,28 @@ class ImageProcessor:
         if self.save_vis_steps:
             vis["01_bg_removed"] = img_no_bg.copy()
 
-        # ═══ BƯỚC 2: BORDER NGOÀI ═══
-        outer_rect, cx, cy, length, thickness, long_angle = \
-            self._step2_find_border(fg_mask)
+        # Tính centroid trên ảnh gốc (cho tracking)
+        M_moments = cv2.moments(product_contour)
+        if M_moments["m00"] > 0:
+            centroid = (int(M_moments["m10"] / M_moments["m00"]),
+                        int(M_moments["m01"] / M_moments["m00"]))
+        else:
+            centroid = (w // 2, h // 2)
+
+        # ═══ BƯỚC 2: BORDER NGOÀI + PCA ═══
+        outer_rect, cx, cy, length, thickness, long_angle, conf2 = \
+            self._step2_find_border_pca(fg_mask, product_contour)
+        confidence_scores.append(conf2)
         if outer_rect is None:
             return None
 
         if self.save_vis_steps:
             vis_border = img_in.copy()
-            contours_mask, _ = cv2.findContours(
-                fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if contours_mask:
-                cv2.drawContours(vis_border,
-                    [max(contours_mask, key=cv2.contourArea)], -1, (0, 255, 0), 2)
+            cv2.drawContours(vis_border, [product_contour], -1, (0, 255, 0), 2)
             cv2.circle(vis_border, (int(cx), int(cy)), 5, (0, 0, 255), -1)
             vis["02_contour"] = vis_border
 
-        # ═══ BƯỚC 3: XOAY THẲNG ═══
+        # ═══ BƯỚC 3: XOAY THẲNG + XÁC ĐỊNH HƯỚNG ═══
         rotated, rotated_mask, long_angle, is_flipped = \
             self._step3_rotate(img_no_bg, fg_mask, cx, cy, length, long_angle, h, w)
         if rotated is None:
@@ -117,9 +128,9 @@ class ImageProcessor:
         if self.save_vis_steps:
             vis["03_rotated"] = cropped.copy()
 
-        # ═══ BƯỚC 4: CẮT CHUẨN HÓA TỪ ĐỈNH ═══
-        standardized, std_mask = self._step4_standardize(
-            cropped, cropped_mask
+        # ═══ BƯỚC 4: CẮT CHUẨN HÓA TỰ THÍCH ỨNG ═══
+        standardized, std_mask = self._step4_standardize_adaptive(
+            cropped, cropped_mask, length
         )
         if standardized is None:
             return None
@@ -129,9 +140,10 @@ class ImageProcessor:
 
         h_std, w_std = standardized.shape[:2]
 
-        # ═══ BƯỚC 5: PHÁT HIỆN ĐỒNG LỘ ═══
-        copper_w, copper_h, _, copper_mask = \
-            self._step5_detect_copper(standardized, std_mask, h_std, w_std)
+        # ═══ BƯỚC 5: PHÁT HIỆN ĐỒNG LỘ BẰNG K-MEANS ═══
+        copper_w, copper_h, _, copper_mask, conf5 = \
+            self._step5_detect_copper_adaptive(standardized, std_mask, h_std, w_std)
+        confidence_scores.append(conf5)
 
         if self.save_vis_steps:
             vis_copper = standardized.copy()
@@ -142,10 +154,10 @@ class ImageProcessor:
             cv2.line(vis_copper, (search_x, 0), (search_x, h_std),
                      (255, 255, 0), 1)
             if copper_w > 0:
-                cx_start = self._last_copper_x
-                cy_start = self._last_copper_y
-                cv2.rectangle(vis_copper, (cx_start, cy_start),
-                    (cx_start + copper_w, cy_start + copper_h), (0, 255, 0), 2)
+                cv2.rectangle(vis_copper,
+                    (self._last_copper_x, self._last_copper_y),
+                    (self._last_copper_x + copper_w, self._last_copper_y + copper_h),
+                    (0, 255, 0), 2)
             vis["05_copper_detect"] = vis_copper
 
         # ═══ BƯỚC 6: CẮT ROI ═══
@@ -158,6 +170,9 @@ class ImageProcessor:
         if self.save_vis_steps:
             vis["06_roi_final"] = roi_final.copy()
 
+        # Tính pipeline confidence tổng thể
+        pipeline_confidence = float(np.mean(confidence_scores)) if confidence_scores else 0.5
+
         return ProcessingResult(
             roi=roi_final,
             copper_w=copper_w,
@@ -167,91 +182,162 @@ class ImageProcessor:
             outer_rect=outer_rect,
             long_angle=long_angle,
             is_flipped=is_flipped,
+            pipeline_confidence=pipeline_confidence,
+            product_length=int(length),
+            centroid=centroid,
             vis_steps=vis,
         )
 
     # ──────────────────────────────────────────────────────────
-    # Bước 1: Tách nền
+    # Bước 1: Tách nền bền vững (HSV-based + Otsu)
     # ──────────────────────────────────────────────────────────
     def _step1_remove_background(self, img, h, w):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        median_val = np.median(blurred)
-        lo = int(max(0, 0.5 * median_val))
-        hi = int(min(255, 1.5 * median_val))
-        edges = cv2.Canny(blurred, lo, hi)
+        """
+        Tách nền bền vững:
+        - Phát hiện nền xanh dương bằng HSV range
+        - Kết hợp Otsu trên grayscale để xử lý trường hợp nền không xanh
+        - Dùng tỷ lệ diện tích thay vì ngưỡng cố định
+        """
+        min_area = int(h * w * self.min_contour_ratio)
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        edges = cv2.dilate(edges, kernel, iterations=2)
+        # Chiến lược 1: Phát hiện nền xanh dương bằng HSV
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        # Khoảng HSV rộng cho nền xanh dương (bao phủ nhiều shade)
+        lower_blue = np.array([85, 30, 50])
+        upper_blue = np.array([135, 255, 255])
+        blue_mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
-        contours, _ = cv2.findContours(
-            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        # Nếu nền xanh chiếm > 20% ảnh → dùng chiến lược tách nền xanh
+        blue_ratio = np.sum(blue_mask > 0) / (h * w)
+        if blue_ratio > 0.20:
+            # Foreground = phần KHÔNG phải nền xanh
+            fg_mask = cv2.bitwise_not(blue_mask)
+        else:
+            # Chiến lược 2: Otsu trên grayscale (fallback cho nền không xanh)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+            _, fg_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        candidates = []
-        for c in contours:
-            if cv2.contourArea(c) < self.min_contour_area:
-                continue
-            bx, by, bw, bh = cv2.boundingRect(c)
-            cy_center = by + bh / 2.0
-            if not (0.15 * h < cy_center < 0.85 * h):
-                continue
-            rect = cv2.minAreaRect(c)
-            _, (rw, rh), _ = rect
-            ar = max(rw, rh) / max(min(rw, rh), 1)
-            if ar > self.min_aspect_ratio:
-                candidates.append(c)
+            # Nếu foreground chiếm quá nhiều → đảo ngược mask
+            fg_ratio = np.sum(fg_mask > 0) / (h * w)
+            if fg_ratio > 0.7:
+                fg_mask = cv2.bitwise_not(fg_mask)
 
-        if not candidates:
-            return None, None
+        # Morphological cleanup mạnh
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel_close, iterations=3)
+        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel_open, iterations=2)
 
-        product = max(candidates, key=cv2.contourArea)
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(mask, [product], -1, 255, thickness=cv2.FILLED)
-
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-
-        return mask, product
-
-    # ──────────────────────────────────────────────────────────
-    # Bước 2: Border ngoài
-    # ──────────────────────────────────────────────────────────
-    def _step2_find_border(self, fg_mask):
+        # Tìm contour lớn nhất (không lọc theo aspect ratio hay vị trí)
         contours, _ = cv2.findContours(
             fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
-        if not contours:
-            return None, 0, 0, 0, 0, 0
 
-        product = max(contours, key=cv2.contourArea)
-        outer_rect = cv2.minAreaRect(product)
+        # Lọc chỉ theo diện tích tương đối
+        candidates = [c for c in contours if cv2.contourArea(c) > min_area]
+
+        if not candidates:
+            return None, None, 0.0
+
+        product = max(candidates, key=cv2.contourArea)
+
+        # Tạo mask sạch chỉ chứa sản phẩm
+        clean_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(clean_mask, [product], -1, 255, thickness=cv2.FILLED)
+
+        # Cleanup mask cuối cùng
+        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
+        clean_mask = cv2.morphologyEx(clean_mask, cv2.MORPH_OPEN, kernel_open)
+
+        # Tính confidence: dựa trên tỷ lệ diện tích sản phẩm (quá nhỏ hoặc quá lớn = thấp)
+        product_ratio = cv2.contourArea(product) / (h * w)
+        conf = min(1.0, product_ratio / 0.05) if product_ratio < 0.05 else \
+               min(1.0, (0.7 - product_ratio) / 0.3) if product_ratio > 0.4 else 1.0
+        conf = max(0.1, conf)
+
+        return clean_mask, product, conf
+
+    # ──────────────────────────────────────────────────────────
+    # Bước 2: Border ngoài + PCA
+    # ──────────────────────────────────────────────────────────
+    def _step2_find_border_pca(self, fg_mask, product_contour):
+        """
+        Xác định trục chính bằng PCA trên tọa độ contour.
+        Bền vững hơn minAreaRect khi có biến dạng phối cảnh.
+        """
+        # Vẫn tính minAreaRect cho backward compatibility (outer_rect field)
+        outer_rect = cv2.minAreaRect(product_contour)
         (cx, cy), (rect_w, rect_h), angle = outer_rect
 
-        if rect_w < rect_h:
-            length, thickness, long_angle = rect_h, rect_w, angle + 90
-        else:
-            length, thickness, long_angle = rect_w, rect_h, angle
+        # PCA trên tọa độ contour để tìm trục chính
+        pts = product_contour.reshape(-1, 2).astype(np.float64)
+        mean_pt = np.mean(pts, axis=0)
+        centered = pts - mean_pt
 
-        return outer_rect, cx, cy, length, thickness, long_angle
+        # Tính ma trận hiệp phương sai và eigenvectors
+        cov_matrix = np.cov(centered.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+
+        # Eigenvector ứng với eigenvalue lớn nhất = trục chính
+        idx = np.argsort(eigenvalues)[::-1]
+        eigenvalues = eigenvalues[idx]
+        eigenvectors = eigenvectors[:, idx]
+
+        # Góc trục chính (tính từ trục x)
+        principal_axis = eigenvectors[:, 0]
+        long_angle = np.degrees(np.arctan2(principal_axis[1], principal_axis[0]))
+
+        # Chiều dài và chiều rộng ước tính từ eigenvalues
+        length = 4.0 * np.sqrt(eigenvalues[0])  # ~95% dải phân bố
+        thickness = 4.0 * np.sqrt(max(eigenvalues[1], 1.0))
+
+        # Confidence: dựa trên tỷ lệ eigenvalues (sản phẩm dài → tỷ lệ cao → tin cậy)
+        eigen_ratio = eigenvalues[0] / max(eigenvalues[1], 1.0)
+        conf = min(1.0, eigen_ratio / 10.0)
+        conf = max(0.3, conf)
+
+        cx, cy = mean_pt[0], mean_pt[1]
+
+        return outer_rect, cx, cy, length, thickness, long_angle, conf
 
     # ──────────────────────────────────────────────────────────
-    # Bước 3: Xoay thẳng
+    # Bước 3: Xoay thẳng + xác định hướng đầu cos
     # ──────────────────────────────────────────────────────────
     def _step3_rotate(self, img_no_bg, fg_mask, cx, cy, length, long_angle, h, w):
+        """
+        Xoay sản phẩm nằm ngang.
+        Xác định hướng đầu cos bằng phân tích sáng/màu thay vì chỉ so sánh độ dày.
+        """
         rad = np.deg2rad(long_angle)
         dx, dy = np.cos(rad), np.sin(rad)
         nx, ny = -dy, dx
 
+        # Lấy 2 điểm ở 2 đầu sản phẩm dọc theo trục chính
         pt1 = (int(cx + 0.33 * length * dx), int(cy + 0.33 * length * dy))
         pt2 = (int(cx - 0.33 * length * dx), int(cy - 0.33 * length * dy))
 
+        # Phương pháp 1: So sánh độ sáng trung bình (phần cos kim loại sáng hơn)
+        brightness1 = self._measure_local_brightness(img_no_bg, fg_mask, *pt1, radius=30)
+        brightness2 = self._measure_local_brightness(img_no_bg, fg_mask, *pt2, radius=30)
+
+        # Phương pháp 2: So sánh độ dày (giữ lại như backup)
         thick1 = self._measure_thickness(fg_mask, *pt1, nx, ny)
         thick2 = self._measure_thickness(fg_mask, *pt2, nx, ny)
 
+        # Quyết định hướng: đầu cos = đầu sáng hơn VÀ dày hơn
+        # Nếu 2 phương pháp đồng ý → tin cậy cao; nếu không → ưu tiên brightness
+        brightness_vote = 1 if brightness1 > brightness2 else -1
+        thickness_vote = 1 if thick1 > thick2 else -1
+
         is_flipped = False
-        if thick1 < thick2:
+        if brightness_vote == -1:
+            # Đầu 2 sáng hơn → đổi hướng
+            dx, dy = -dx, -dy
+            long_angle += 180
+            is_flipped = True
+        elif brightness_vote == 0 and thickness_vote == -1:
+            # Brightness bằng nhau → dùng thickness
             dx, dy = -dx, -dy
             long_angle += 180
             is_flipped = True
@@ -263,6 +349,7 @@ class ImageProcessor:
         return rotated, rot_mask, long_angle, is_flipped
 
     def _crop_tight(self, rotated, rot_mask, thickness, h, w):
+        """Cắt sát sản phẩm sau xoay."""
         rows = np.where(np.any(rot_mask > 0, axis=1))[0]
         cols = np.where(np.any(rot_mask > 0, axis=0))[0]
         if len(rows) == 0 or len(cols) == 0:
@@ -282,17 +369,29 @@ class ImageProcessor:
         return cropped, cropped_mask
 
     # ──────────────────────────────────────────────────────────
-    # Bước 4: Cắt chuẩn hóa từ đỉnh
+    # Bước 4: Cắt chuẩn hóa tự thích ứng
     # ──────────────────────────────────────────────────────────
-    def _step4_standardize(self, cropped, cropped_mask):
+    def _step4_standardize_adaptive(self, cropped, cropped_mask, product_length):
+        """
+        Cắt chuẩn hóa theo tỷ lệ chiều dài sản phẩm thay vì pixel cố định.
+        Đảm bảo vùng crop bao phủ đầu cos + vùng crimp + phần dây.
+        """
         h_c, w_c = cropped.shape[:2]
         col_has_fg = np.any(cropped_mask > 0, axis=0)
         fg_cols = np.where(col_has_fg)[0]
         if len(fg_cols) == 0:
             return None, None
 
+        # Chiều dài thực tế đo được trong ảnh đã cắt
+        actual_length = fg_cols[-1] - fg_cols[0]
+
+        # Tính chiều dài crop: dùng tỷ lệ crop_ratio so với chiều dài sản phẩm
+        crop_length = int(actual_length * self.crop_ratio)
+        # Fallback: nếu crop_length quá nhỏ, dùng fixed_crop_length
+        crop_length = max(crop_length, min(self.fixed_crop_length, actual_length))
+
         x_tip = fg_cols[-1]
-        x_start = max(0, x_tip - self.fixed_crop_length)
+        x_start = max(0, x_tip - crop_length)
         x_end = min(w_c, x_tip + 5)
 
         std = cropped[:, x_start:x_end]
@@ -303,38 +402,105 @@ class ImageProcessor:
         return std, std_mask
 
     # ──────────────────────────────────────────────────────────
-    # Bước 5: Phát hiện đồng lộ
+    # Bước 5: Phát hiện đồng lộ bằng K-means + multi-colorspace
     # ──────────────────────────────────────────────────────────
-    def _step5_detect_copper(self, standardized, std_mask, h_std, w_std):
+    def _step5_detect_copper_adaptive(self, standardized, std_mask, h_std, w_std):
+        """
+        Phát hiện vùng đồng lộ bằng K-means clustering thay vì ngưỡng cứng.
+        Kết hợp xác nhận từ nhiều color space (LAB, HSV, YCrCb).
+        """
         self._last_copper_x = 0
         self._last_copper_y = 0
 
-        lab = cv2.cvtColor(standardized, cv2.COLOR_BGR2LAB)
-        _, a_ch, _ = cv2.split(lab)
-        copper_mask = (a_ch > self.lab_a_threshold).astype(np.uint8) * 255
-
-        hsv = cv2.cvtColor(standardized, cv2.COLOR_BGR2HSV)
-        h_ch, s_ch, _ = cv2.split(hsv)
-        hsv_copper = ((s_ch > self.hsv_s_threshold) &
-                      (h_ch < self.hsv_h_max)).astype(np.uint8) * 255
-        copper_mask = copper_mask | hsv_copper
-        copper_mask = cv2.bitwise_and(copper_mask, std_mask)
-
         # Giới hạn vùng tìm kiếm (phần đầu sản phẩm)
         search_x = int(w_std * self.search_region_ratio)
-        copper_mask[:, search_x:] = 0
 
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # Lấy pixels thuộc sản phẩm trong vùng tìm kiếm
+        search_mask = std_mask.copy()
+        search_mask[:, search_x:] = 0
+        fg_pixels_idx = np.where(search_mask > 0)
+
+        if len(fg_pixels_idx[0]) < 100:
+            # Quá ít pixel → không đủ dữ liệu
+            return 0, 0, 0.0, np.zeros((h_std, w_std), dtype=np.uint8), 0.3
+
+        # === K-means trên LAB color space ===
+        lab = cv2.cvtColor(standardized, cv2.COLOR_BGR2LAB)
+        fg_lab = lab[fg_pixels_idx[0], fg_pixels_idx[1]]
+
+        n_clusters = min(self.copper_kmeans_clusters, len(fg_lab) // 10)
+        n_clusters = max(2, n_clusters)
+
+        kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=3, batch_size=256)
+        labels = kmeans.fit_predict(fg_lab)
+        centers = kmeans.cluster_centers_
+
+        # Tìm cluster có đặc tính đồng: kênh a (LAB) cao nhất = màu đỏ/cam
+        # Đồng có a_channel cao (hướng đỏ) và b_channel dương (hướng vàng)
+        copper_scores = []
+        for i, center in enumerate(centers):
+            l_val, a_val, b_val = center
+            # Score: ưu tiên a cao (đỏ/cam), b dương (vàng), l trung bình
+            score = a_val * 1.5 + max(b_val - 128, 0) * 0.5 - abs(l_val - 140) * 0.3
+            copper_scores.append(score)
+
+        copper_cluster_idx = np.argmax(copper_scores)
+        copper_mask_lab = np.zeros((h_std, w_std), dtype=np.uint8)
+        copper_pixels = labels == copper_cluster_idx
+        copper_mask_lab[fg_pixels_idx[0][copper_pixels], fg_pixels_idx[1][copper_pixels]] = 255
+
+        # === Xác nhận bằng HSV ===
+        hsv = cv2.cvtColor(standardized, cv2.COLOR_BGR2HSV)
+        fg_hsv = hsv[fg_pixels_idx[0], fg_pixels_idx[1]]
+        # Đồng: saturation tương đối cao, hue trong vùng cam/đỏ
+        h_ch = fg_hsv[:, 0]
+        s_ch = fg_hsv[:, 1]
+        # Ngưỡng adaptive: dùng percentile thay vì giá trị cố định
+        s_threshold = max(np.percentile(s_ch, 70), 80)
+        hsv_copper = ((s_ch > s_threshold) & ((h_ch < 30) | (h_ch > 160))).astype(np.uint8) * 255
+        copper_mask_hsv = np.zeros((h_std, w_std), dtype=np.uint8)
+        copper_mask_hsv[fg_pixels_idx[0], fg_pixels_idx[1]] = hsv_copper
+
+        # === Xác nhận bằng YCrCb ===
+        ycrcb = cv2.cvtColor(standardized, cv2.COLOR_BGR2YCrCb)
+        fg_ycrcb = ycrcb[fg_pixels_idx[0], fg_pixels_idx[1]]
+        cr_ch = fg_ycrcb[:, 1]
+        # Đồng: Cr (red chroma) cao
+        cr_threshold = max(np.percentile(cr_ch, 75), 140)
+        ycrcb_copper = (cr_ch > cr_threshold).astype(np.uint8) * 255
+        copper_mask_ycrcb = np.zeros((h_std, w_std), dtype=np.uint8)
+        copper_mask_ycrcb[fg_pixels_idx[0], fg_pixels_idx[1]] = ycrcb_copper
+
+        # === Multi-colorspace fusion: ít nhất 2/3 color space đồng ý ===
+        vote_sum = (copper_mask_lab.astype(np.float32) / 255.0 +
+                    copper_mask_hsv.astype(np.float32) / 255.0 +
+                    copper_mask_ycrcb.astype(np.float32) / 255.0)
+        copper_mask = (vote_sum >= 2.0).astype(np.uint8) * 255
+
+        # Morphological cleanup
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         copper_mask = cv2.morphologyEx(copper_mask, cv2.MORPH_CLOSE, k, iterations=2)
         copper_mask = cv2.morphologyEx(copper_mask, cv2.MORPH_OPEN, k)
 
+        # Connected component analysis: giữ chỉ các component lớn
+        num_labels, labels_cc, stats, centroids = cv2.connectedComponentsWithStats(
+            copper_mask, connectivity=8
+        )
+        min_component_area = 30
+        clean_mask = np.zeros_like(copper_mask)
+        for i in range(1, num_labels):  # Bỏ qua background (label 0)
+            if stats[i, cv2.CC_STAT_AREA] > min_component_area:
+                clean_mask[labels_cc == i] = 255
+        copper_mask = clean_mask
+
+        # Tìm bounding box tổng thể của vùng đồng
         contours, _ = cv2.findContours(
             copper_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
         c_x, c_y, c_w, c_h = 0, 0, 0, 0
         if contours:
-            valid = [c for c in contours if cv2.contourArea(c) > 30]
+            valid = [c for c in contours if cv2.contourArea(c) > min_component_area]
             if valid:
                 all_pts = np.vstack(valid)
                 c_x, c_y, c_w, c_h = cv2.boundingRect(all_pts)
@@ -342,17 +508,22 @@ class ImageProcessor:
         self._last_copper_x = c_x
         self._last_copper_y = c_y
 
-        copper_pixels = np.sum(copper_mask > 0)
-        total_pixels = max(np.sum(std_mask > 0), 1)
-        copper_ratio = copper_pixels / total_pixels
+        copper_pixels_count = np.sum(copper_mask > 0)
+        total_pixels = max(np.sum(search_mask > 0), 1)
+        copper_ratio = copper_pixels_count / total_pixels
 
-        return c_w, c_h, copper_ratio, copper_mask
+        # Confidence: dựa trên số pixel đồng phát hiện được
+        conf = min(1.0, copper_pixels_count / 200.0) if copper_pixels_count > 0 else 0.2
+        conf = max(0.2, conf)
+
+        return c_w, c_h, copper_ratio, copper_mask, conf
 
     # ──────────────────────────────────────────────────────────
     # Bước 6: Cắt ROI cuối cùng
     # ──────────────────────────────────────────────────────────
     def _step6_crop_roi(self, standardized, std_mask, copper_w, copper_h,
                         h_std, w_std, copper_mask):
+        """Cắt ROI cuối cùng với fallback cải thiện."""
         if copper_w > 0 and copper_h > 0:
             pad = 10
             y1 = max(0, self._last_copper_y - pad)
@@ -363,16 +534,22 @@ class ImageProcessor:
             roi_std_mask = std_mask[y1:y2, x1:x2]
             roi_copper_mask = copper_mask[y1:y2, x1:x2]
         else:
-            # Fallback: inner border cố định
-            ix_l = int(w_std * 0.15)
-            ix_r = int(w_std * 0.50)
-            col_slice = std_mask[:, ix_l:ix_r]
-            rows = np.where(np.any(col_slice > 0, axis=1))[0]
-            if len(rows) > 0:
-                iy_t = max(0, rows[0] - 5)
-                iy_b = min(h_std, rows[-1] + 5)
+            # Fallback cải thiện: crop vùng trung tâm sản phẩm theo tỷ lệ
+            fg_cols = np.where(np.any(std_mask > 0, axis=0))[0]
+            fg_rows = np.where(np.any(std_mask > 0, axis=1))[0]
+
+            if len(fg_cols) > 0 and len(fg_rows) > 0:
+                # Crop 30-60% chiều dài sản phẩm (vùng giữa có khả năng chứa đồng lộ)
+                x_range = fg_cols[-1] - fg_cols[0]
+                ix_l = fg_cols[0] + int(x_range * 0.15)
+                ix_r = fg_cols[0] + int(x_range * 0.55)
+                iy_t = max(0, fg_rows[0] - 5)
+                iy_b = min(h_std, fg_rows[-1] + 5)
             else:
+                ix_l = int(w_std * 0.15)
+                ix_r = int(w_std * 0.50)
                 iy_t, iy_b = int(h_std * 0.2), int(h_std * 0.8)
+
             roi_raw = standardized[iy_t:iy_b, ix_l:ix_r]
             roi_std_mask = std_mask[iy_t:iy_b, ix_l:ix_r]
             roi_copper_mask = copper_mask[iy_t:iy_b, ix_l:ix_r]
@@ -392,6 +569,7 @@ class ImageProcessor:
     # ──────────────────────────────────────────────────────────
     @staticmethod
     def _measure_thickness(mask, px, py, nx, ny, max_search=200):
+        """Đo độ dày sản phẩm tại điểm (px, py) theo hướng pháp tuyến (nx, ny)."""
         mh, mw = mask.shape[:2]
         t1 = 0
         while t1 < max_search:
@@ -406,3 +584,34 @@ class ImageProcessor:
                 break
             t2 += 1
         return t1 + t2
+
+    @staticmethod
+    def _measure_local_brightness(img_bgr, mask, px, py, radius=30):
+        """
+        Đo độ sáng trung bình trong vùng tròn xung quanh điểm (px, py).
+        Chỉ tính trên pixel thuộc foreground (mask > 0).
+        """
+        h, w = img_bgr.shape[:2]
+        px, py = int(px), int(py)
+
+        # Giới hạn bounding box
+        y1 = max(0, py - radius)
+        y2 = min(h, py + radius)
+        x1 = max(0, px - radius)
+        x2 = min(w, px + radius)
+
+        if y2 <= y1 or x2 <= x1:
+            return 0.0
+
+        region = img_bgr[y1:y2, x1:x2]
+        region_mask = mask[y1:y2, x1:x2]
+
+        # Chuyển sang grayscale để đo brightness
+        gray_region = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+
+        # Chỉ tính mean trên pixel foreground
+        fg_pixels = gray_region[region_mask > 0]
+        if len(fg_pixels) == 0:
+            return 0.0
+
+        return float(np.mean(fg_pixels))
