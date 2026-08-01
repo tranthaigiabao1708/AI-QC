@@ -16,6 +16,10 @@ DATA_DIR = PROJECT_DIR / "data" / "training_images" / "labeled"
 # Thư mục ảnh gốc để test inference (nằm trong project)
 RAW_DATA_DIR = PROJECT_DIR / "data" / "raw_images"
 
+# Thư mục ảnh reference templates cho Feature Matching detector
+REFERENCE_DIR = PROJECT_DIR / "data" / "reference_templates"
+REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+
 # Thư mục kết quả đầu ra
 OUTPUT_DIR = PROJECT_DIR / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

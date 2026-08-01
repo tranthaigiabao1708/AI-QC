@@ -1,8 +1,8 @@
 """
 preprocessing/image_processor.py
 ─────────────────────────────────
-Pipeline 6 bước xử lý ảnh sản phẩm crimping — PHIÊN BẢN BỀN VỮNG (Robust V2):
-  Bước 1: Tách nền bền vững (HSV-based + Otsu, không ngưỡng cứng)
+Pipeline 6 bước xử lý ảnh sản phẩm crimping — PHIÊN BẢN BỀN VỮNG (Robust V3):
+  Bước 1: Phát hiện sản phẩm (Feature Matching → fallback rule-based)
   Bước 2: Phát hiện contour + PCA xác định trục chính
   Bước 3: Xoay thẳng + xác định hướng đầu cos bằng phân tích sáng/màu
   Bước 4: Cắt tự thích ứng (adaptive crop theo tỷ lệ chiều dài sản phẩm)
@@ -13,9 +13,19 @@ Pipeline 6 bước xử lý ảnh sản phẩm crimping — PHIÊN BẢN BỀN V
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple
+from pathlib import Path
 import cv2
 import numpy as np
 from sklearn.cluster import MiniBatchKMeans
+from loguru import logger
+
+try:
+    from preprocessing.object_detector import ProductDetector
+except ImportError:
+    try:
+        from object_detector import ProductDetector
+    except ImportError:
+        ProductDetector = None
 
 
 @dataclass
@@ -58,6 +68,7 @@ class ImageProcessor:
         copper_kmeans_clusters: int = 4,
         search_region_ratio: float = 0.60,
         save_vis_steps: bool = True,
+        reference_dir: Optional[str] = None,
     ):
         self.target_size = target_size
         self.crop_ratio = crop_ratio
@@ -71,6 +82,29 @@ class ImageProcessor:
         self._last_copper_x = 0
         self._last_copper_y = 0
 
+        # ═══ Feature Matching Detector (Mới — V3) ═══
+        self.detector = None
+        if ProductDetector is not None:
+            # Auto-detect reference directory
+            if reference_dir is None:
+                # Thử tìm thư mục reference_templates
+                possible_dirs = [
+                    Path(__file__).resolve().parent.parent / "data" / "reference_templates",
+                    Path.cwd() / "data" / "reference_templates",
+                ]
+                for d in possible_dirs:
+                    if d.exists() and any(d.iterdir()):
+                        reference_dir = str(d)
+                        break
+            
+            if reference_dir and Path(reference_dir).exists():
+                self.detector = ProductDetector(reference_dir=reference_dir)
+                if self.detector.is_ready:
+                    logger.info(f"Feature Matching detector loaded from: {reference_dir}")
+                else:
+                    self.detector = None
+                    logger.info("No valid reference images found — using rule-based detection.")
+
     def process(self, img_in: np.ndarray) -> Optional[ProcessingResult]:
         """
         Chạy pipeline 6 bước trên ảnh đầu vào.
@@ -83,15 +117,37 @@ class ImageProcessor:
         vis = {}
         confidence_scores = []  # Thu thập điểm tin cậy từ mỗi bước
 
-        # ═══ BƯỚC 1: TÁCH NỀN BỀN VỮNG ═══
-        fg_mask, product_contour, conf1 = self._step1_remove_background(img_in, h, w)
+        # ═══ BƯỚC 1: PHÁT HIỆN SẢN PHẨM ═══
+        # Ưu tiên Feature Matching → fallback Rule-based
+        detection_method = "rule-based"
+        fg_mask = None
+        product_contour = None
+        conf1 = 0.0
+
+        if self.detector is not None:
+            det_result = self.detector.detect(img_in)
+            if det_result is not None and det_result['confidence'] > 0.3:
+                fg_mask = det_result['mask']
+                product_contour = det_result['contour']
+                conf1 = det_result['confidence']
+                detection_method = f"feature-match ({det_result['ref_name']}, {det_result['match_count']} matches)"
+
+        # Fallback: rule-based nếu feature matching thất bại
+        if fg_mask is None:
+            fg_mask, product_contour, conf1 = self._step1_remove_background(img_in, h, w)
+            detection_method = "rule-based (fallback)"
+
         confidence_scores.append(conf1)
         if fg_mask is None:
             return None
 
         img_no_bg = cv2.bitwise_and(img_in, img_in, mask=fg_mask)
         if self.save_vis_steps:
-            vis["01_bg_removed"] = img_no_bg.copy()
+            # Vẽ thêm method vào ảnh visualization
+            vis_bg = img_no_bg.copy()
+            cv2.putText(vis_bg, detection_method, (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            vis["01_bg_removed"] = vis_bg
 
         # Tính centroid trên ảnh gốc (cho tracking)
         M_moments = cv2.moments(product_contour)
