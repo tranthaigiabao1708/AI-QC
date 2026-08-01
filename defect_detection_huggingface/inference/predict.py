@@ -32,9 +32,13 @@ class QualityInspector:
         from transformers.utils.logging import disable_progress_bar
         disable_progress_bar()
 
-        # Kiểm tra xem mô hình đã được huấn luyện chưa
+        # Kiểm tra xem mô hình đã được huấn luyện chưa (cần có file weights thực tế)
         self.use_onnx = False
-        if (Path(model_dir) / "config.json").exists():
+        has_weights = (
+            (Path(model_dir) / "model.safetensors").exists() or
+            (Path(model_dir) / "pytorch_model.bin").exists()
+        )
+        if has_weights and (Path(model_dir) / "config.json").exists():
             model_dir_str = str(Path(model_dir).resolve())
             logger.info(f"Đang tải mô hình đã huấn luyện từ: {model_dir_str}...")
             self.image_processor = AutoImageProcessor.from_pretrained(model_dir_str)
