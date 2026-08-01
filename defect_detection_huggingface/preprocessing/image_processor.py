@@ -195,15 +195,23 @@ class ImageProcessor:
         """
         Tách nền đa chiến lược — hoạt động với BẤT KỲ nền nào:
         1. Phát hiện nền xanh dương (HSV)
-        2. Phát hiện dây trắng + kim loại sáng (LAB lightness + low saturation)
+        2. Phát hiện dây trắng + kim loại sáng (LAB + saturation)
         3. Edge-based (Canny + morphological) cho nền có texture
-        4. Otsu với blur mạnh (fallback cuối)
-        Chọn chiến lược cho kết quả contour tốt nhất (dài, rõ ràng).
+        4. CLAHE enhanced edge (cho nền trắng/xám nhạt)
+        5. Otsu với blur mạnh (fallback cuối)
+
+        QUAN TRỌNG: Mỗi candidate contour được chấm điểm theo:
+        - Aspect ratio (sản phẩm dài)
+        - Diện tích hợp lý
+        - Edge density BÊN TRONG contour (sản phẩm thật có texture, nền trơn thì không)
         """
         min_area = int(h * w * self.min_contour_ratio)
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+
+        # Tính edge map toàn cục (dùng cho scoring sau)
+        edges_global = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 50, 150)
 
         candidate_masks = []
 
@@ -216,12 +224,9 @@ class ImageProcessor:
             fg1 = cv2.bitwise_not(blue_mask)
             candidate_masks.append(("blue_bg", fg1))
 
-        # ── Chiến lược 2: Phát hiện dây trắng + kim loại sáng ──
-        # Sản phẩm cos đồng = dây trắng (L cao, S thấp) + đầu kim loại (L cao)
-        l_channel = lab[:, :, 0]       # Lightness
-        s_channel = hsv[:, :, 1]       # Saturation
-
-        # Vùng sáng VÀ ít màu → dây trắng + kim loại
+        # ── Chiến lược 2: Phát hiện dây trắng + kim loại ──
+        l_channel = lab[:, :, 0]
+        s_channel = hsv[:, :, 1]
         bright_threshold = np.percentile(l_channel, 65)
         low_sat_threshold = np.percentile(s_channel, 50)
         wire_mask = ((l_channel > bright_threshold) & (s_channel < low_sat_threshold)).astype(np.uint8) * 255
@@ -230,10 +235,8 @@ class ImageProcessor:
         # ── Chiến lược 3: Edge-based (cho nền có texture) ──
         blurred_edge = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred_edge, 30, 100)
-        # Nối các edge lại thành vùng kín
         kernel_edge = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
         edges_closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel_edge, iterations=4)
-        # Fill holes
         edges_filled = edges_closed.copy()
         flood_fill_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
         cv2.floodFill(edges_filled, flood_fill_mask, (0, 0), 255)
@@ -241,7 +244,20 @@ class ImageProcessor:
         edges_combined = cv2.bitwise_or(edges_closed, edges_filled)
         candidate_masks.append(("edge_based", edges_combined))
 
-        # ── Chiến lược 4: Otsu với blur mạnh (fallback) ──
+        # ── Chiến lược 4: CLAHE enhanced (cho nền trắng/xám nhạt) ──
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        edges_clahe = cv2.Canny(enhanced, 40, 120)
+        kernel_clahe = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 13))
+        clahe_closed = cv2.morphologyEx(edges_clahe, cv2.MORPH_CLOSE, kernel_clahe, iterations=5)
+        clahe_filled = clahe_closed.copy()
+        flood_fill_mask2 = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        cv2.floodFill(clahe_filled, flood_fill_mask2, (0, 0), 255)
+        clahe_filled = cv2.bitwise_not(clahe_filled)
+        clahe_combined = cv2.bitwise_or(clahe_closed, clahe_filled)
+        candidate_masks.append(("clahe_edge", clahe_combined))
+
+        # ── Chiến lược 5: Otsu với blur mạnh (fallback) ──
         blurred_heavy = cv2.GaussianBlur(gray, (21, 21), 0)
         _, otsu_mask = cv2.threshold(blurred_heavy, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         fg_ratio = np.sum(otsu_mask > 0) / (h * w)
@@ -271,40 +287,63 @@ class ImageProcessor:
             if not candidates:
                 continue
 
-            product = max(candidates, key=cv2.contourArea)
-            area = cv2.contourArea(product)
+            # Đánh giá TẤT CẢ contour đủ lớn, không chỉ lớn nhất
+            for product in sorted(candidates, key=cv2.contourArea, reverse=True)[:3]:
+                area = cv2.contourArea(product)
 
-            # Tính aspect ratio để ưu tiên contour dài (giống dây cos)
-            rect = cv2.minAreaRect(product)
-            rect_w, rect_h = rect[1]
-            if min(rect_w, rect_h) > 0:
-                aspect = max(rect_w, rect_h) / min(rect_w, rect_h)
-            else:
-                aspect = 1.0
+                # Aspect ratio
+                rect = cv2.minAreaRect(product)
+                rect_w, rect_h = rect[1]
+                if min(rect_w, rect_h) > 0:
+                    aspect = max(rect_w, rect_h) / min(rect_w, rect_h)
+                else:
+                    aspect = 1.0
 
-            area_ratio = area / (h * w)
+                area_ratio = area / (h * w)
 
-            # Score: ưu tiên contour dài (aspect > 2), diện tích vừa phải (5-50% ảnh)
-            score = 0.0
-            # Aspect ratio: sản phẩm cos đồng luôn dài → ưu tiên AR > 2
-            if aspect > 2.0:
-                score += min(aspect, 10.0) * 10
-            else:
-                score += aspect * 2
+                # ═══ EDGE DENSITY: phân biệt sản phẩm thật vs nền trơn ═══
+                # Sản phẩm thật (dây + kim loại + đồng) có nhiều edge bên trong
+                # Nền trơn (trắng, xám) gần như không có edge
+                contour_mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.drawContours(contour_mask, [product], -1, 255, thickness=cv2.FILLED)
+                edge_inside = cv2.bitwise_and(edges_global, contour_mask)
+                contour_pixels = max(np.sum(contour_mask > 0), 1)
+                edge_density = np.sum(edge_inside > 0) / contour_pixels
 
-            # Diện tích: ưu tiên 3-40% ảnh
-            if 0.03 < area_ratio < 0.40:
-                score += 50
-            elif 0.01 < area_ratio <= 0.03:
-                score += 20
-            elif area_ratio >= 0.40:
-                score += 10
+                # ═══ Tính điểm tổng hợp ═══
+                score = 0.0
 
-            if score > best_score:
-                best_score = score
-                best_product = product
-                best_mask = cleaned
-                best_strategy = name
+                # Aspect ratio: sản phẩm cos đồng luôn dài
+                if aspect > 2.5:
+                    score += min(aspect, 10.0) * 10
+                elif aspect > 1.5:
+                    score += aspect * 5
+                else:
+                    score += aspect * 1
+
+                # Diện tích: ưu tiên 3-40% ảnh
+                if 0.03 < area_ratio < 0.40:
+                    score += 50
+                elif 0.01 < area_ratio <= 0.03:
+                    score += 20
+                elif area_ratio >= 0.40:
+                    score += 5  # Quá lớn = nghi ngờ
+
+                # Edge density: QUAN TRỌNG NHẤT — sản phẩm thật có edge density > 0.02
+                if edge_density > 0.05:
+                    score += 80  # Rất nhiều edge = chắc chắn là sản phẩm
+                elif edge_density > 0.02:
+                    score += 40  # Có edge = có thể là sản phẩm
+                elif edge_density > 0.01:
+                    score += 10
+                else:
+                    score -= 30  # Gần như không có edge = có thể là nền trơn
+
+                if score > best_score:
+                    best_score = score
+                    best_product = product
+                    best_mask = cleaned
+                    best_strategy = name
 
         if best_product is None:
             return None, None, 0.0
@@ -321,14 +360,23 @@ class ImageProcessor:
         rect_w, rect_h = rect[1]
         aspect = max(rect_w, rect_h) / max(min(rect_w, rect_h), 1)
 
-        # Sản phẩm lý tưởng: aspect > 3, diện tích 5-30%
-        conf = 0.5
+        # Tính edge density cho confidence
+        final_mask_check = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(final_mask_check, [best_product], -1, 255, thickness=cv2.FILLED)
+        edge_in = cv2.bitwise_and(edges_global, final_mask_check)
+        final_edge_density = np.sum(edge_in > 0) / max(np.sum(final_mask_check > 0), 1)
+
+        conf = 0.3
         if aspect > 3.0:
-            conf += 0.3
+            conf += 0.25
         elif aspect > 2.0:
-            conf += 0.15
+            conf += 0.1
         if 0.05 < product_ratio < 0.30:
-            conf += 0.2
+            conf += 0.15
+        if final_edge_density > 0.03:
+            conf += 0.3
+        elif final_edge_density > 0.01:
+            conf += 0.1
         conf = max(0.2, min(1.0, conf))
 
         return clean_mask, best_product, conf
