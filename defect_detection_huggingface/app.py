@@ -274,258 +274,247 @@ if app_mode == "📷 Ảnh tĩnh (Upload/Chọn mẫu)":
 
 
 # ═════════════════════════════════════════════════════════════════
-# CHẾ ĐỘ 2: LIVE CAMERA — XỬ LÝ LIÊN TỤC KHÔNG CẦN ẤN CHỤP
+# CHẾ ĐỘ 2: LIVE CAMERA — XỬ LÝ LIÊN TỤC
 # ═════════════════════════════════════════════════════════════════
 elif app_mode == "📹 Live Camera":
 
     st.subheader("📹 Nhận Diện Trực Tiếp Từ Camera")
 
-    # Sidebar config cho live mode
+    # Sidebar config
     st.sidebar.subheader("📹 Cấu hình Live Camera")
     camera_id = st.sidebar.number_input("Camera ID", min_value=0, max_value=10, value=config.CAMERA_ID)
     process_every = st.sidebar.slider("Xử lý mỗi N frame", min_value=1, max_value=10, value=3,
-                                       help="Giảm để tăng tốc độ phản hồi, tăng để giảm tải CPU")
+                                       help="Giảm để phản hồi nhanh, tăng để giảm tải CPU")
 
-    # Khởi tạo session state
-    if "live_running" not in st.session_state:
-        st.session_state.live_running = False
+    # Session state
     if "last_result" not in st.session_state:
         st.session_state.last_result = None
     if "stats" not in st.session_state:
         st.session_state.stats = {"total": 0, "ok": 0, "ng": 0}
 
-    # Nút điều khiển
-    col_start, col_stop, col_reset = st.columns(3)
-    with col_start:
-        start_btn = st.button("▶️ Bắt đầu Live", type="primary", use_container_width=True)
-    with col_stop:
-        stop_btn = st.button("⏹️ Dừng", use_container_width=True)
-    with col_reset:
-        reset_btn = st.button("🔄 Reset thống kê", use_container_width=True)
+    # ═══ 2 TAB: Live liên tục + Chụp thủ công ═══
+    tab_live, tab_capture = st.tabs(["🎬 Live liên tục", "📸 Chụp thủ công"])
 
-    if start_btn:
-        st.session_state.live_running = True
-    if stop_btn:
-        st.session_state.live_running = False
-    if reset_btn:
-        st.session_state.stats = {"total": 0, "ok": 0, "ng": 0}
+    # ──── TAB 1: LIVE ────
+    with tab_live:
+        col_ctrl1, col_ctrl2 = st.columns([2, 1])
+        with col_ctrl1:
+            run_live = st.toggle("▶️ Bật Camera Live", value=False, key="live_toggle",
+                                 help="Bật/tắt camera. Click lại để dừng.")
+        with col_ctrl2:
+            if st.button("🔄 Reset thống kê", key="reset_live"):
+                st.session_state.stats = {"total": 0, "ok": 0, "ng": 0}
 
-    st.markdown("---")
+        st.markdown("---")
 
-    # Layout chính: video feed + kết quả
-    col_video, col_result = st.columns([2, 1])
+        col_video, col_result = st.columns([2, 1])
+        with col_video:
+            video_placeholder = st.empty()
+        with col_result:
+            result_banner = st.empty()
+            result_details = st.empty()
+            roi_placeholder = st.empty()
+            stats_placeholder = st.empty()
 
-    with col_video:
-        video_placeholder = st.empty()
-    with col_result:
-        result_banner = st.empty()
-        result_details = st.empty()
-        roi_placeholder = st.empty()
-        stats_placeholder = st.empty()
+        status_bar = st.empty()
+        pipeline_exp = st.expander("⚙️ Debug Pipeline", expanded=False)
+        pipeline_ph = pipeline_exp.empty()
 
-    status_bar = st.empty()
-
-    # Pipeline debug section
-    pipeline_expander = st.expander("⚙️ Debug Pipeline — Xem chi tiết từng bước xử lý ảnh", expanded=True)
-    pipeline_placeholder = pipeline_expander.empty()
-
-    # ─── VÒNG LẶP LIVE ───
-    if st.session_state.live_running and model_loaded:
-        cap = cv2.VideoCapture(camera_id)
-
-        if not cap.isOpened():
-            st.error(f"❌ Không thể mở camera ID={camera_id}. Kiểm tra camera đã kết nối chưa.")
-            st.session_state.live_running = False
-        else:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-            frame_count = 0
-            last_result = st.session_state.last_result
-            fps_start = time.time()
-            fps_count = 0
-
-            try:
-                while st.session_state.live_running:
-                    ret, frame = cap.read()
-                    if not ret:
-                        status_bar.warning("⚠️ Mất kết nối camera...")
-                        break
-
-                    frame_count += 1
-                    fps_count += 1
-                    display_frame = frame.copy()
-
-                    # Xử lý pipeline mỗi N frame
-                    if frame_count % process_every == 0:
-                        try:
-                            result = inspector.inspect(frame)
-                            if result["success"]:
-                                last_result = result
-                                st.session_state.last_result = result
-
-                                # Cập nhật thống kê
-                                st.session_state.stats["total"] += 1
-                                is_ok = "OK" in result["decision"] and "NG" not in result["decision"]
-                                if is_ok:
-                                    st.session_state.stats["ok"] += 1
-                                else:
-                                    st.session_state.stats["ng"] += 1
-                        except Exception:
-                            pass
-
-                    # Vẽ overlay lên frame hiển thị
-                    if last_result and last_result["success"]:
-                        decision = last_result["decision"]
-                        confidence = last_result["confidence"]
-                        copper_ratio = last_result["copper_ratio"]
-                        pipeline_conf = last_result.get("pipeline_confidence", 1.0)
-                        is_ok = "OK" in decision and "NG" not in decision
-
-                        # Vẽ text overlay trên frame
-                        color = (0, 255, 0) if is_ok else (0, 0, 255)
-                        label = f"{'OK' if is_ok else 'NG'} ({confidence:.0%})"
-                        cv2.putText(display_frame, label, (10, 40),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-                        cv2.putText(display_frame, f"Copper: {copper_ratio:.1%} | Pipeline: {pipeline_conf:.0%}",
-                                    (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-                        # Vẽ viền màu theo kết quả
-                        border_color = (0, 200, 0) if is_ok else (0, 0, 200)
-                        cv2.rectangle(display_frame, (0, 0),
-                                      (display_frame.shape[1]-1, display_frame.shape[0]-1),
-                                      border_color, 4)
-
-                    # Tính FPS
-                    elapsed = time.time() - fps_start
-                    if elapsed > 0:
-                        current_fps = fps_count / elapsed
-                    else:
-                        current_fps = 0
-                    cv2.putText(display_frame, f"FPS: {current_fps:.1f}", (display_frame.shape[1] - 150, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-                    # Reset FPS counter mỗi 2 giây
-                    if elapsed > 2.0:
-                        fps_start = time.time()
-                        fps_count = 0
-
-                    # Hiển thị frame
-                    frame_rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    video_placeholder.image(frame_rgb, channels="RGB", use_container_width=True)
-
-                    # Cập nhật panel kết quả
-                    if last_result and last_result["success"]:
-                        decision = last_result["decision"]
-                        is_ok = "OK" in decision and "NG" not in decision
-
-                        if is_ok:
-                            result_banner.success(f"✅ **OK** — {last_result['confidence']:.1%}")
-                        else:
-                            result_banner.error(f"❌ **NG** — {decision}")
-
-                        result_details.markdown(
-                            f"- Đồng lộ: **{last_result['copper_ratio']:.1%}**\n"
-                            f"- Pipeline: **{last_result.get('pipeline_confidence', 0):.0%}**\n"
-                            f"- Copper: {last_result['copper_w']}×{last_result['copper_h']}px"
-                        )
-
-                        try:
-                            roi_rgb = cv2.cvtColor(last_result["roi"], cv2.COLOR_BGR2RGB)
-                            roi_placeholder.image(roi_rgb, width=160, caption="ROI")
-                        except Exception:
-                            pass
-
-                    # Cập nhật pipeline steps visualization
-                    if last_result and last_result.get("vis_steps"):
-                        vis_steps = last_result["vis_steps"]
-                        steps_keys = [
-                            ("01_bg_removed", "Bước 1: Tách nền", "Multi-strategy: HSV blue + wire detect + edge + Otsu"),
-                            ("02_contour", "Bước 2: Tìm contour", "PCA trục chính + tâm trọng lực"),
-                            ("03_rotated", "Bước 3: Xoay thẳng", "Xoay + phân tích sáng xác định hướng đầu cos"),
-                            ("04_standardized", "Bước 4: Cắt chuẩn hóa", "Crop adaptive theo % chiều dài sản phẩm"),
-                            ("05_copper_detect", "Bước 5: Vùng đồng lộ", "K-means + multi-colorspace voting"),
-                            ("06_roi_final", "Bước 6: ROI", "Cắt ROI → resize 224×224")
-                        ]
-                        with pipeline_placeholder.container():
-                            for r in range(2):
-                                cols_pipe = st.columns(3)
-                                for c in range(3):
-                                    idx = r * 3 + c
-                                    key, title, desc = steps_keys[idx]
-                                    with cols_pipe[c]:
-                                        st.markdown(f"**{title}**")
-                                        st.caption(desc)
-                                        if key in vis_steps:
-                                            step_rgb = cv2.cvtColor(vis_steps[key], cv2.COLOR_BGR2RGB)
-                                            st.image(step_rgb, use_container_width=True)
-                                        else:
-                                            st.warning("❌ Bước này thất bại")
-
-                    # Cập nhật thống kê
-                    s = st.session_state.stats
-                    stats_placeholder.markdown(
-                        f"### 📊 Thống kê\n"
-                        f"- Tổng: **{s['total']}**\n"
-                        f"- ✅ OK: **{s['ok']}**\n"
-                        f"- ❌ NG: **{s['ng']}**"
-                    )
-
-                    # Delay nhỏ để không block hoàn toàn
-                    time.sleep(0.03)
-
-            except Exception as e:
-                st.error(f"Lỗi camera: {e}")
-            finally:
-                cap.release()
-                st.session_state.live_running = False
-                status_bar.info("📷 Camera đã dừng.")
-
-    elif not st.session_state.live_running:
-        video_placeholder.info("📷 Nhấn **▶️ Bắt đầu Live** để bắt đầu nhận diện liên tục từ camera.")
-
-        # Hiển thị kết quả cuối cùng nếu có
-        if st.session_state.last_result and st.session_state.last_result["success"]:
-            lr = st.session_state.last_result
-            decision = lr["decision"]
-            is_ok = "OK" in decision and "NG" not in decision
-            if is_ok:
-                result_banner.success(f"✅ Kết quả cuối: **OK** ({lr['confidence']:.1%})")
+        if run_live:
+            if not model_loaded:
+                st.error("❌ Model chưa tải. Xem log để biết chi tiết.")
             else:
-                result_banner.error(f"❌ Kết quả cuối: **NG** — {decision}")
+                cap = cv2.VideoCapture(camera_id)
+                if not cap.isOpened():
+                    st.error(f"❌ Không mở được camera ID={camera_id}.")
+                    st.info("💡 Thử đổi Camera ID (0, 1, 2...) hoặc kiểm tra driver.")
+                else:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    status_bar.success(f"📷 Camera {camera_id} đang chạy...")
 
-            # Hiển thị pipeline steps cuối cùng khi đã dừng
-            if lr.get("vis_steps"):
-                vis_steps = lr["vis_steps"]
-                steps_keys = [
-                    ("01_bg_removed", "Bước 1: Tách nền", "Multi-strategy background removal"),
-                    ("02_contour", "Bước 2: Tìm contour", "PCA + tâm trọng lực"),
-                    ("03_rotated", "Bước 3: Xoay thẳng", "Xoay + xác định hướng"),
-                    ("04_standardized", "Bước 4: Cắt chuẩn hóa", "Crop adaptive"),
-                    ("05_copper_detect", "Bước 5: Vùng đồng lộ", "K-means + colorspace voting"),
-                    ("06_roi_final", "Bước 6: ROI", "ROI 224×224")
-                ]
-                with pipeline_placeholder.container():
-                    for r in range(2):
-                        cols_pipe = st.columns(3)
-                        for c in range(3):
-                            idx = r * 3 + c
-                            key, title, desc = steps_keys[idx]
-                            with cols_pipe[c]:
-                                st.markdown(f"**{title}**")
-                                st.caption(desc)
-                                if key in vis_steps:
-                                    step_rgb = cv2.cvtColor(vis_steps[key], cv2.COLOR_BGR2RGB)
-                                    st.image(step_rgb, use_container_width=True)
+                    frame_count = 0
+                    last_result = st.session_state.last_result
+                    fps_start = time.time()
+                    fps_count = 0
+
+                    try:
+                        while True:
+                            ret, frame = cap.read()
+                            if not ret:
+                                status_bar.warning("⚠️ Mất kết nối camera.")
+                                break
+
+                            frame_count += 1
+                            fps_count += 1
+                            display_frame = frame.copy()
+
+                            # Pipeline mỗi N frame
+                            if frame_count % process_every == 0:
+                                try:
+                                    result = inspector.inspect(frame)
+                                    if result["success"]:
+                                        last_result = result
+                                        st.session_state.last_result = result
+                                        st.session_state.stats["total"] += 1
+                                        is_ok = "OK" in result["decision"] and "NG" not in result["decision"]
+                                        st.session_state.stats["ok" if is_ok else "ng"] += 1
+                                except Exception:
+                                    pass
+
+                            # Overlay
+                            if last_result and last_result.get("success"):
+                                d = last_result
+                                is_ok = "OK" in d["decision"] and "NG" not in d["decision"]
+                                color = (0, 255, 0) if is_ok else (0, 0, 255)
+                                cv2.putText(display_frame,
+                                            f"{'OK' if is_ok else 'NG'} ({d['confidence']:.0%})",
+                                            (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+                                cv2.putText(display_frame,
+                                            f"Copper: {d['copper_ratio']:.1%} | Pipeline: {d.get('pipeline_confidence',0):.0%}",
+                                            (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                                cv2.rectangle(display_frame, (0, 0),
+                                              (display_frame.shape[1]-1, display_frame.shape[0]-1),
+                                              (0, 200, 0) if is_ok else (0, 0, 200), 4)
+
+                            # FPS
+                            elapsed = time.time() - fps_start
+                            fps = fps_count / elapsed if elapsed > 0 else 0
+                            cv2.putText(display_frame, f"FPS: {fps:.1f}",
+                                        (display_frame.shape[1]-150, 30),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                            if elapsed > 2.0:
+                                fps_start, fps_count = time.time(), 0
+
+                            # Display
+                            video_placeholder.image(
+                                cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB),
+                                channels="RGB", use_container_width=True
+                            )
+
+                            # Result panel
+                            if last_result and last_result.get("success"):
+                                d = last_result
+                                is_ok = "OK" in d["decision"] and "NG" not in d["decision"]
+                                if is_ok:
+                                    result_banner.success(f"✅ **OK** — {d['confidence']:.1%}")
                                 else:
-                                    st.warning("❌ Bước này thất bại")
+                                    result_banner.error(f"❌ **NG** — {d['decision']}")
+                                result_details.markdown(
+                                    f"- Đồng lộ: **{d['copper_ratio']:.1%}**\n"
+                                    f"- Pipeline: **{d.get('pipeline_confidence',0):.0%}**\n"
+                                    f"- Copper: {d['copper_w']}×{d['copper_h']}px"
+                                )
+                                try:
+                                    roi_placeholder.image(
+                                        cv2.cvtColor(d["roi"], cv2.COLOR_BGR2RGB),
+                                        width=160, caption="ROI"
+                                    )
+                                except Exception:
+                                    pass
 
-        s = st.session_state.stats
-        if s["total"] > 0:
-            stats_placeholder.markdown(
-                f"### 📊 Thống kê phiên\n"
-                f"- Tổng: **{s['total']}**\n"
-                f"- ✅ OK: **{s['ok']}**\n"
-                f"- ❌ NG: **{s['ng']}**"
-            )
+                            # Pipeline debug
+                            if last_result and last_result.get("vis_steps"):
+                                vs = last_result["vis_steps"]
+                                skeys = [
+                                    ("01_bg_removed", "1: Detect"),
+                                    ("02_contour", "2: Contour"),
+                                    ("03_rotated", "3: Rotate"),
+                                    ("04_standardized", "4: Crop"),
+                                    ("05_copper_detect", "5: Copper"),
+                                    ("06_roi_final", "6: ROI"),
+                                ]
+                                with pipeline_ph.container():
+                                    cols = st.columns(6)
+                                    for i, (k, t) in enumerate(skeys):
+                                        with cols[i]:
+                                            st.caption(t)
+                                            if k in vs:
+                                                st.image(cv2.cvtColor(vs[k], cv2.COLOR_BGR2RGB),
+                                                         use_container_width=True)
 
+                            # Stats
+                            s = st.session_state.stats
+                            stats_placeholder.markdown(
+                                f"📊 Tổng: **{s['total']}** | "
+                                f"✅ OK: **{s['ok']}** | "
+                                f"❌ NG: **{s['ng']}**"
+                            )
+
+                            time.sleep(0.03)
+
+                    except Exception as e:
+                        st.error(f"Lỗi: {e}")
+                    finally:
+                        cap.release()
+                        status_bar.info("📷 Camera dừng. Bật lại toggle để chạy.")
+
+        else:
+            video_placeholder.info("📷 **Bật toggle ở trên** để bắt đầu live camera.")
+            if st.session_state.last_result and st.session_state.last_result.get("success"):
+                lr = st.session_state.last_result
+                is_ok = "OK" in lr["decision"] and "NG" not in lr["decision"]
+                if is_ok:
+                    result_banner.success(f"✅ Cuối cùng: **OK** ({lr['confidence']:.1%})")
+                else:
+                    result_banner.error(f"❌ Cuối cùng: **NG** — {lr['decision']}")
+
+    # ──── TAB 2: CHỤP THỦ CÔNG ────
+    with tab_capture:
+        st.markdown("### 📸 Chụp từ Camera Web")
+        st.info("💡 Dùng chế độ này nếu Live không hoạt động trên trình duyệt.")
+
+        camera_photo = st.camera_input("Nhấn chụp để kiểm tra:", key="cam_capture")
+
+        if camera_photo is not None and model_loaded:
+            file_bytes = np.asarray(bytearray(camera_photo.read()), dtype=np.uint8)
+            img_bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+            if img_bgr is not None:
+                with st.spinner("Đang phân tích..."):
+                    result = inspector.inspect(img_bgr)
+
+                if result["success"]:
+                    d = result
+                    is_ok = "OK" in d["decision"] and "NG" not in d["decision"]
+                    if is_ok:
+                        st.success(f"✅ **OK** — {d['confidence']:.1%} | Đồng lộ: {d['copper_ratio']:.1%}")
+                    else:
+                        st.error(f"❌ **NG** — {d['decision']} | Đồng lộ: {d['copper_ratio']:.1%}")
+
+                    c1, c2 = st.columns([2, 1])
+                    with c1:
+                        st.image(cv2.cvtColor(d["vis_img"], cv2.COLOR_BGR2RGB),
+                                 use_container_width=True, caption="Kết quả")
+                    with c2:
+                        st.image(cv2.cvtColor(d["roi"], cv2.COLOR_BGR2RGB),
+                                 width=180, caption="ROI")
+
+                    # Pipeline debug
+                    if d.get("vis_steps"):
+                        with st.expander("⚙️ Debug Pipeline", expanded=True):
+                            vs = d["vis_steps"]
+                            skeys = [
+                                ("01_bg_removed", "1: Detect", "Feature Matching → fallback"),
+                                ("02_contour", "2: Contour", "PCA"),
+                                ("03_rotated", "3: Rotate", ""),
+                                ("04_standardized", "4: Crop", "Adaptive"),
+                                ("05_copper_detect", "5: Copper", "K-means"),
+                                ("06_roi_final", "6: ROI", "224×224"),
+                            ]
+                            for row in range(2):
+                                cols = st.columns(3)
+                                for c in range(3):
+                                    idx = row * 3 + c
+                                    k, t, desc = skeys[idx]
+                                    with cols[c]:
+                                        st.markdown(f"**{t}**")
+                                        if desc:
+                                            st.caption(desc)
+                                        if k in vs:
+                                            st.image(cv2.cvtColor(vs[k], cv2.COLOR_BGR2RGB),
+                                                     use_container_width=True)
+                                        else:
+                                            st.warning("❌")
+                else:
+                    st.error(f"Thất bại: {result['error']}")
