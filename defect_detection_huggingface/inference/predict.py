@@ -62,6 +62,7 @@ class QualityInspector:
                 self.model = AutoModelForImageClassification.from_pretrained(model_dir_str)
                 self.model.to(self.device)
                 self.model.eval()
+            self.has_trained_model = True
         else:
             logger.warning(f"Không tìm thấy mô hình đã huấn luyện tại: {model_dir}!")
             logger.warning(f"Tải mô hình gốc (chưa tinh chỉnh) từ Hugging Face Hub: {config.MODEL_NAME}...")
@@ -69,6 +70,7 @@ class QualityInspector:
             self.model = AutoModelForImageClassification.from_pretrained(config.MODEL_NAME, num_labels=2, ignore_mismatched_sizes=True)
             self.model.to(self.device)
             self.model.eval()
+            self.has_trained_model = False
 
         # Khởi tạo OpenCV Image Processor (phiên bản robust V2)
         self.opencv_processor = ImageProcessor(
@@ -78,7 +80,8 @@ class QualityInspector:
             min_contour_ratio=getattr(config, 'MIN_CONTOUR_RATIO', 0.02),
             copper_kmeans_clusters=getattr(config, 'COPPER_KMEANS_CLUSTERS', 4),
         )
-        logger.info("Khởi tạo hệ thống QualityInspector V2 thành công!")
+        mode_str = "CV+AI" if self.has_trained_model else "CV-only (model chưa train)"
+        logger.info(f"Khởi tạo QualityInspector V3 thành công! Mode: {mode_str}")
 
     def inspect(self, img_bgr):
         """
@@ -124,26 +127,76 @@ class QualityInspector:
             pred_idx = torch.argmax(probs).item()
             confidence = probs[pred_idx].item()
 
-        # Đưa ra quyết định cuối cùng
+        # ═══ QUYẾT ĐỊNH CUỐI CÙNG: CV-FIRST + AI-BOOST ═══
+        # Ưu tiên kết quả Computer Vision (copper_ratio, pipeline_confidence)
+        # Model AI chỉ bổ trợ khi đã được train đầy đủ
         pred_label = config.CLASS_NAMES[pred_idx]
 
-        # Lấy ngưỡng động từ self nếu có
+        # Lấy ngưỡng động
         conf_thresh = getattr(self, "confidence_threshold", config.CONFIDENCE_THRESHOLD)
         min_ratio = getattr(self, "min_copper_ratio", config.MIN_COPPER_RATIO)
         max_ratio = getattr(self, "max_copper_ratio", config.MAX_COPPER_RATIO)
 
-        # Phân loại thực tế (AI + quy tắc vật lý + pipeline confidence)
-        if proc_result.pipeline_confidence < 0.4:
-            final_decision = "NG (Pipeline confidence thấp — cần kiểm tra thủ công)"
+        # ── Bước A: Kiểm tra pipeline có đáng tin không ──
+        pipeline_conf = proc_result.pipeline_confidence
+        copper_ratio = proc_result.copper_ratio
+
+        if pipeline_conf < 0.3:
+            final_decision = "NG (Pipeline không detect được sản phẩm)"
             color = (0, 165, 255)
-        elif pred_label == "OK" and confidence < conf_thresh:
-            final_decision = "NG (Độ tin cậy OK thấp)"
-            color = (0, 165, 255)
-        elif pred_label == "OK" and (proc_result.copper_ratio < min_ratio or proc_result.copper_ratio > max_ratio):
-            final_decision = f"NG (Lỗi tỷ lệ đồng lộ: {proc_result.copper_ratio:.2%})"
+            effective_confidence = pipeline_conf
+
+        # ── Bước B: Quyết định bằng Computer Vision (copper_ratio) ──
+        elif copper_ratio > max_ratio:
+            # Đồng lộ quá nhiều → NG chắc chắn (CV)
+            final_decision = f"NG (Đồng lộ quá cao: {copper_ratio:.1%})"
             color = (0, 0, 255)
+            effective_confidence = 0.9  # CV rất tự tin
+
+        elif copper_ratio < min_ratio and pipeline_conf > 0.5:
+            # Không thấy đồng NHƯNG pipeline detect tốt → OK (CV)
+            # Sản phẩm OK = đồng không lộ ra ngoài
+            if self.has_trained_model and pred_label == "NG" and confidence > 0.85:
+                # Model đã train VÀ rất tự tin NG → tin model
+                final_decision = f"NG (AI phát hiện lỗi: {confidence:.0%})"
+                color = (0, 0, 255)
+                effective_confidence = confidence
+            else:
+                final_decision = "OK"
+                color = (0, 255, 0)
+                # Confidence = trung bình pipeline + (model nếu đã train)
+                if self.has_trained_model:
+                    effective_confidence = 0.5 * pipeline_conf + 0.5 * confidence
+                else:
+                    effective_confidence = pipeline_conf * 0.9
+
+        elif min_ratio <= copper_ratio <= max_ratio:
+            # Đồng lộ trong khoảng cho phép → có thể OK hoặc NG tùy mức
+            if self.has_trained_model:
+                # Model đã train → dùng model quyết định
+                final_decision = pred_label
+                effective_confidence = confidence
+                color = (0, 255, 0) if pred_label == "OK" else (0, 0, 255)
+            else:
+                # Model chưa train → dùng quy tắc: copper gần min → OK, gần max → NG
+                mid_point = (min_ratio + max_ratio) / 2
+                if copper_ratio < mid_point:
+                    final_decision = "OK"
+                    color = (0, 255, 0)
+                    effective_confidence = pipeline_conf * 0.8
+                else:
+                    final_decision = f"NG (Đồng lộ: {copper_ratio:.1%})"
+                    color = (0, 0, 255)
+                    effective_confidence = pipeline_conf * 0.7
+
         else:
-            final_decision = pred_label
+            # Fallback
+            if self.has_trained_model:
+                final_decision = pred_label
+                effective_confidence = confidence
+            else:
+                final_decision = "OK"
+                effective_confidence = pipeline_conf * 0.7
             color = (0, 255, 0) if final_decision == "OK" else (0, 0, 255)
 
         # 4. Vẽ trực quan hóa trên ảnh gốc
@@ -154,21 +207,22 @@ class QualityInspector:
             box = np.intp(box)
             cv2.drawContours(vis_img, [box], 0, color, 3)
 
-        text = f"QC DECISION: {final_decision} ({confidence:.1%})"
+        text = f"QC DECISION: {final_decision} ({effective_confidence:.1%})"
         cv2.putText(vis_img, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
 
-        spec_text = f"Copper Area Ratio: {proc_result.copper_ratio:.1%} | Pipeline Conf: {proc_result.pipeline_confidence:.0%}"
+        mode_text = "CV+AI" if self.has_trained_model else "CV-only"
+        spec_text = f"Copper: {copper_ratio:.1%} | Pipeline: {pipeline_conf:.0%} | Mode: {mode_text}"
         cv2.putText(vis_img, spec_text, (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
         return {
             "success": True,
             "decision": final_decision,
             "raw_decision": pred_label,
-            "confidence": confidence,
-            "copper_ratio": proc_result.copper_ratio,
+            "confidence": effective_confidence,
+            "copper_ratio": copper_ratio,
             "copper_w": proc_result.copper_w,
             "copper_h": proc_result.copper_h,
-            "pipeline_confidence": proc_result.pipeline_confidence,
+            "pipeline_confidence": pipeline_conf,
             "centroid": proc_result.centroid,
             "product_length": proc_result.product_length,
             "vis_img": vis_img,
