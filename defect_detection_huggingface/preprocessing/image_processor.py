@@ -48,7 +48,8 @@ class ProcessingResult:
     copper_bbox_orig: Optional[Tuple[int, int, int, int]] = None
     terminal_pts: Optional[np.ndarray] = None  # (4, 2) Đỉnh khung đen xoay (crimp barrel)
     copper_pts: Optional[np.ndarray] = None    # (4, 2) Đỉnh khung xanh xoay (vùng đồng)
-    smooth_contour: Optional[np.ndarray] = None # Contour bo sát vật thể sau khi tách nền
+    smooth_contour: Optional[np.ndarray] = None # Contour bo sát toàn bộ sản phẩm sau tách nền
+    terminal_contour: Optional[np.ndarray] = None # Contour bo sát phần kim loại (sắt + đồng)
 
     # Ảnh trực quan hóa từng bước
     vis_steps: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -256,6 +257,32 @@ class ImageProcessor:
                 epsilon = 0.001 * cv2.arcLength(c_best_sm, True)
                 smooth_contour = cv2.approxPolyDP(c_best_sm, epsilon, True)
 
+        # Tạo terminal_contour bo sát 100% ranh giới phần kim loại (sắt + đồng) trên ảnh đã remove BG
+        terminal_contour = None
+        if bg_fg_mask is not None and product_contour is not None:
+            img_fg = cv2.bitwise_and(img_in, img_in, mask=bg_fg_mask)
+            lab_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2LAB)
+            hsv_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2HSV)
+
+            L_f = lab_fg[:, :, 0]
+            A_f = lab_fg[:, :, 1]
+            S_f = hsv_fg[:, :, 1]
+
+            is_metal = (bg_fg_mask > 0) & (L_f > 30) & ((L_f < 210) | (S_f > 18) | (A_f >= 123))
+            metal_mask = is_metal.astype(np.uint8) * 255
+
+            x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
+            metal_mask[y_bb + int(h_bb * 0.42):, :] = 0
+            metal_mask[:y_bb, :] = 0
+
+            k_m = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+            metal_cleaned = cv2.morphologyEx(metal_mask, cv2.MORPH_CLOSE, k_m, iterations=2)
+
+            m_cnts, _ = cv2.findContours(metal_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            valid_m = [c for c in m_cnts if cv2.contourArea(c) > 500]
+            if valid_m:
+                terminal_contour = max(valid_m, key=cv2.contourArea)
+
         # Tính pipeline confidence tổng thể
         pipeline_confidence = float(np.mean(confidence_scores)) if confidence_scores else 0.5
 
@@ -279,6 +306,7 @@ class ImageProcessor:
             terminal_pts=terminal_pts,
             copper_pts=copper_pts,
             smooth_contour=smooth_contour,
+            terminal_contour=terminal_contour,
             vis_steps=vis,
         )
 

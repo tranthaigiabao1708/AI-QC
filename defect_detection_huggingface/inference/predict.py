@@ -210,8 +210,10 @@ class QualityInspector:
             box = np.intp(box)
             cv2.drawContours(vis_img, [box], 0, (0, 255, 0), 3)
 
-        # 2. Khung giữa (Đen): Bao quanh phần thân cos kim loại (NẰM HOÀN TOÀN TRONG KHUNG MẸ)
-        if proc_result.terminal_pts is not None:
+        # 2. Border đen trung tâm: Bo sát 100% đường viền phần kim loại cos (crimp barrel)
+        if proc_result.terminal_contour is not None:
+            cv2.drawContours(vis_img, [proc_result.terminal_contour], -1, (0, 0, 0), 3)
+        elif proc_result.terminal_pts is not None:
             cv2.drawContours(vis_img, [proc_result.terminal_pts], 0, (0, 0, 0), 3)
         elif proc_result.terminal_bbox is not None:
             tx1, ty1, tx2, ty2 = proc_result.terminal_bbox
