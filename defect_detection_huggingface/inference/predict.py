@@ -199,11 +199,13 @@ class QualityInspector:
                 effective_confidence = pipeline_conf * 0.7
             color = (0, 255, 0) if final_decision == "OK" else (0, 0, 255)
 
-        # 4. Vẽ trực quan hóa 3 khung xoay đồng góc (minAreaRect-aligned) trên ảnh gốc
+        # 4. Vẽ trực quan hóa 3 thành phần trên ảnh gốc theo đúng yêu cầu
         vis_img = img_bgr.copy()
 
-        # 1. Khung ngoài cùng (Xanh lá): Bao quanh toàn bộ sản phẩm (Rotated Rect)
-        if proc_result.outer_rect is not None:
+        # 1. Border xanh lá cây ngoài cùng: Bo sát 100% theo dạng thực tế của vật thể sau khi remove background
+        if proc_result.smooth_contour is not None:
+            cv2.drawContours(vis_img, [proc_result.smooth_contour], -1, (0, 255, 0), 3)
+        elif proc_result.outer_rect is not None:
             box = cv2.boxPoints(proc_result.outer_rect)
             box = np.intp(box)
             cv2.drawContours(vis_img, [box], 0, (0, 255, 0), 3)

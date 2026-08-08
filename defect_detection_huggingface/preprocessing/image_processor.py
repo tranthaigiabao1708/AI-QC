@@ -48,6 +48,7 @@ class ProcessingResult:
     copper_bbox_orig: Optional[Tuple[int, int, int, int]] = None
     terminal_pts: Optional[np.ndarray] = None  # (4, 2) Đỉnh khung đen xoay (crimp barrel)
     copper_pts: Optional[np.ndarray] = None    # (4, 2) Đỉnh khung xanh xoay (vùng đồng)
+    smooth_contour: Optional[np.ndarray] = None # Contour bo sát vật thể sau khi tách nền
 
     # Ảnh trực quan hóa từng bước
     vis_steps: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -238,6 +239,23 @@ class ImageProcessor:
         if self.save_vis_steps:
             vis["06_roi_final"] = roi_final.copy()
 
+        # Tạo smooth_contour bo sát 100% đường viền thật của sản phẩm từ mask tách nền LAB
+        bg_fg_mask, _, _ = self._step1_remove_background(img_in, h, w)
+        smooth_contour = None
+        if bg_fg_mask is not None:
+            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            cleaned_m = cv2.morphologyEx(bg_fg_mask, cv2.MORPH_CLOSE, k_close, iterations=3)
+            cleaned_m = cv2.morphologyEx(cleaned_m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+
+            blurred_mask = cv2.GaussianBlur(cleaned_m, (21, 21), 0)
+            _, th_smooth = cv2.threshold(blurred_mask, 120, 255, cv2.THRESH_BINARY)
+            cnts_smooth, _ = cv2.findContours(th_smooth, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            valid_sm = [c for c in cnts_smooth if cv2.contourArea(c) > 10000 and (0.2*w <= (cv2.boundingRect(c)[0]+cv2.boundingRect(c)[2]/2) <= 0.8*w)]
+            if valid_sm:
+                c_best_sm = max(valid_sm, key=cv2.contourArea)
+                epsilon = 0.001 * cv2.arcLength(c_best_sm, True)
+                smooth_contour = cv2.approxPolyDP(c_best_sm, epsilon, True)
+
         # Tính pipeline confidence tổng thể
         pipeline_confidence = float(np.mean(confidence_scores)) if confidence_scores else 0.5
 
@@ -260,6 +278,7 @@ class ImageProcessor:
             centroid=centroid,
             terminal_pts=terminal_pts,
             copper_pts=copper_pts,
+            smooth_contour=smooth_contour,
             vis_steps=vis,
         )
 
