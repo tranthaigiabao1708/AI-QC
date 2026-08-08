@@ -262,45 +262,75 @@ class ImageProcessor:
         )
 
     def _get_visualization_bboxes(self, img, product_contour, h, w):
-        """Tính khung đen (đầu cos kim loại) và khung xanh/đỏ (vùng đồng) trên tọa độ ảnh gốc."""
+        """Tính khung đen (đầu cos kim loại) NẰM HOÀN TOÀN TRONG khung mẹ và khung xanh/đỏ (vùng đồng lộ)."""
         if product_contour is None:
             return None, None
 
         x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
 
-        # Khung đen: bao quanh phần thân cos kim loại (crimp barrel)
+        # 1. Khung đen: Bao quanh phần thân cos kim loại (crimp barrel), ép NẰM HOÀN TOÀN TRONG khung mẹ
         if h_bb >= w_bb:
             t_y1 = y_bb + int(h_bb * 0.22)
-            t_y2 = y_bb + int(h_bb * 0.38)
-            t_x1 = max(0, x_bb - 4)
-            t_x2 = min(w, x_bb + w_bb + 4)
+            t_y2 = y_bb + int(h_bb * 0.37)
         else:
-            t_x1 = x_bb + int(w_bb * 0.22)
-            t_x2 = x_bb + int(w_bb * 0.38)
-            t_y1 = max(0, y_bb - 4)
-            t_y2 = min(h, y_bb + h_bb + 4)
+            t_y1 = y_bb + int(h_bb * 0.22)
+            t_y2 = y_bb + int(h_bb * 0.37)
+
+        # Tạo mask của product contour tại dải y của crimp barrel để ép x1, x2 nằm hẳn bên trong
+        cnt_mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(cnt_mask, [product_contour], -1, 255, -1)
+        crimp_strip_mask = cnt_mask[t_y1:t_y2, :]
+
+        cols_in_strip = np.where(np.any(crimp_strip_mask > 0, axis=0))[0]
+        if len(cols_in_strip) > 0:
+            t_x1 = cols_in_strip[0] + 2
+            t_x2 = cols_in_strip[-1] - 2
+        else:
+            t_x1, t_x2 = x_bb + 2, x_bb + w_bb - 2
 
         terminal_bbox = (t_x1, t_y1, t_x2, t_y2)
 
-        # Khung xanh/đỏ: bao quanh toàn bộ dải đồng lộ ra ở đầu cos
+        # 2. Khung xanh/đỏ: Bao trọn toàn bộ dải đồng lộ tại khớp nối (kể cả màu đồng bị xám do ánh sáng)
         copper_bbox_orig = None
         roi_img = img[t_y1:t_y2, t_x1:t_x2]
-        if roi_img.size > 0:
-            roi_hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-            roi_lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
-            c_hsv = cv2.inRange(roi_hsv, np.array([3, 35, 40]), np.array([25, 255, 230]))
-            c_lab = ((roi_lab[:, :, 1] > 125) & (roi_lab[:, :, 2] > 125)).astype(np.uint8) * 255
-            c_comb = cv2.bitwise_or(c_hsv, c_lab)
+        c_roi_mask = cnt_mask[t_y1:t_y2, t_x1:t_x2]
 
-            k_copper = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+        if roi_img.size > 0:
+            r_lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
+            r_hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+
+            L = r_lab[:, :, 0]
+            A = r_lab[:, :, 1]
+            B = r_lab[:, :, 2]
+            H_c = r_hsv[:, :, 0]
+            S_c = r_hsv[:, :, 1]
+            V_c = r_hsv[:, :, 2]
+
+            # Phân tách màu đồng nhạy hơn với ánh sáng thực tế (đồng rực + đồng bị xám/tối)
+            c_hsv = (H_c >= 2) & (H_c <= 28) & (S_c > 30) & (V_c < 230)
+            c_greyed = (A >= 123) & (A > B - 3) & (L < 165) & (S_c > 12) & (c_roi_mask > 0)
+            c_comb = (c_hsv | c_greyed).astype(np.uint8) * 255
+
+            # Chỉ tập trung ở vùng khớp nối đỉnh (0-40% chiều cao Crimp ROI)
+            crimp_h = roi_img.shape[0]
+            c_comb[int(crimp_h * 0.40):, :] = 0
+
+            k_copper = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
             c_comb = cv2.morphologyEx(c_comb, cv2.MORPH_CLOSE, k_copper, iterations=2)
 
             cnts, _ = cv2.findContours(c_comb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             valid = [c for c in cnts if cv2.contourArea(c) > 10]
             if valid:
                 all_pts = np.vstack(valid)
-                cx, cy, cw, ch = cv2.boundingRect(all_pts)
-                copper_bbox_orig = (t_x1 + cx, t_y1 + cy, t_x1 + cx + cw, t_y1 + cy + ch)
+                cx_c, cy_c, cw_c, ch_c = cv2.boundingRect(all_pts)
+
+                margin_x = int(roi_img.shape[1] * 0.08)
+                cx_final = max(2, cx_c - margin_x)
+                cw_final = min(roi_img.shape[1] - cx_final - 2, cw_c + margin_x * 2)
+                cy_final = max(1, cy_c - 1)
+                ch_final = ch_c + 2
+
+                copper_bbox_orig = (t_x1 + cx_final, t_y1 + cy_final, t_x1 + cx_final + cw_final, t_y1 + cy_final + ch_final)
 
         return terminal_bbox, copper_bbox_orig
 
