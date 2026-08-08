@@ -210,25 +210,35 @@ class QualityInspector:
             box = np.intp(box)
             cv2.drawContours(vis_img, [box], 0, (0, 255, 0), 3)
 
-        # 2. Border đen trung tâm: Bo sát 100% đường viền phần kim loại cos (crimp barrel)
+        # 2. Border đen trung tâm: Bo sát 100% đường viền phần kim loại cos (crimp barrel + ring head)
         if proc_result.terminal_contour is not None:
-            cv2.drawContours(vis_img, [proc_result.terminal_contour], -1, (0, 0, 0), 3)
+            img_h, img_w = vis_img.shape[:2]
+            border_canvas = np.zeros((img_h, img_w), dtype=np.uint8)
+            cv2.drawContours(border_canvas, [proc_result.terminal_contour], -1, 255, 3)
+            if hasattr(proc_result, 'metal_end_y') and proc_result.metal_end_y > 0:
+                border_canvas[proc_result.metal_end_y - 2:, :] = 0
+            vis_img[border_canvas > 0] = (0, 0, 0)
         elif proc_result.terminal_pts is not None:
             cv2.drawContours(vis_img, [proc_result.terminal_pts], 0, (0, 0, 0), 3)
         elif proc_result.terminal_bbox is not None:
             tx1, ty1, tx2, ty2 = proc_result.terminal_bbox
             cv2.rectangle(vis_img, (tx1, ty1), (tx2, ty2), (0, 0, 0), 3)
 
-        # 3. Khung trong cùng (Xanh lá / Đỏ): Bao quanh tất cả dải đồng lộ ra & ghi tỉ lệ % diện tích so với khung kim loại
+        # 3. Khoanh vùng đồng lộ (Xanh lá / Đỏ): Bo sát 100% đường viền dải đồng (contours bám khoang màu) + tỉ lệ % diện tích
         spec_ratios = []
         if proc_result.copper_details:
             for item in proc_result.copper_details:
                 (c_x, c_y, c_w, c_h) = item['box']
                 r_pct = item['ratio_pct']
                 p_name = item['pos_name']
-                cv2.rectangle(vis_img, (c_x, c_y), (c_x + c_w, c_y + c_h), color, 2)
+                
+                # Vẽ border bám sát khoang màu đồng
+                if 'contours' in item and item['contours']:
+                    cv2.drawContours(vis_img, item['contours'], -1, color, 2)
+                else:
+                    cv2.rectangle(vis_img, (c_x, c_y), (c_x + c_w, c_y + c_h), color, 2)
 
-                # Vẽ nhãn % diện tích đồng ngay bên cạnh từng khung đồng
+                # Vẽ nhãn % diện tích đồng ngay bên cạnh khoang màu đồng
                 lbl = f"{p_name}: {r_pct:.2f}%"
                 cv2.putText(vis_img, lbl, (c_x + c_w + 10, c_y + c_h // 2 + 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)

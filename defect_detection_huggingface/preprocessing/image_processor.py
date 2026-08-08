@@ -52,6 +52,7 @@ class ProcessingResult:
     terminal_contour: Optional[np.ndarray] = None # Contour bo sát phần kim loại (sắt + đồng)
     copper_boxes: List[Tuple[int, int, int, int]] = field(default_factory=list) # Danh sách (x, y, w, h) các dải đồng
     metal_area_px: float = 0.0 # Diện tích phần kim loại (border đen) tính theo px2
+    metal_end_y: int = 0 # Tọa độ Y kết thúc của phần kim loại
     copper_details: List[Dict[str, Any]] = field(default_factory=list) # Danh sách chứa thông tin tỉ lệ % từng vùng đồng
 
     # Ảnh trực quan hóa từng bước
@@ -127,32 +128,20 @@ class ImageProcessor:
         confidence_scores = []  # Thu thập điểm tin cậy từ mỗi bước
 
         # ═══ BƯỚC 1: PHÁT HIỆN SẢN PHẨM ═══
-        # Ưu tiên Feature Matching → fallback Rule-based
+        fg_mask, product_contour, conf1 = self._step1_remove_background(img_in, h, w)
         detection_method = "rule-based"
-        fg_mask = None
-        product_contour = None
-        conf1 = 0.0
 
         if self.detector is not None:
             det_result = self.detector.detect(img_in)
             if det_result is not None and det_result['confidence'] > 0.5:
-                # Validate: kiểm tra vị trí và kích thước để loại label strip
                 bx, by, bw, bh = det_result['bbox']
                 center_y = by + bh / 2
                 min_dim = min(bw, bh)
-                # Reject nếu: (1) sát mép trên/dưới ảnh, hoặc (2) quá mỏng
                 is_valid_position = h * 0.15 < center_y < h * 0.85
                 is_valid_thickness = min_dim > h * 0.05
                 if is_valid_position and is_valid_thickness:
-                    fg_mask = det_result['mask']
-                    product_contour = det_result['contour']
-                    conf1 = det_result['confidence']
+                    conf1 = max(conf1, det_result['confidence'])
                     detection_method = f"feature-match ({det_result['ref_name']}, {det_result['match_count']} matches)"
-
-        # Fallback: rule-based nếu feature matching thất bại
-        if fg_mask is None:
-            fg_mask, product_contour, conf1 = self._step1_remove_background(img_in, h, w)
-            detection_method = "rule-based (fallback)"
 
         confidence_scores.append(conf1)
         if fg_mask is None:
@@ -265,6 +254,12 @@ class ImageProcessor:
         copper_boxes = []
         copper_details = []
 
+        if bg_fg_mask is not None:
+            cnts_full, _ = cv2.findContours(cleaned_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            valid_full = [c for c in cnts_full if cv2.contourArea(c) > 10000 and (0.2*w <= (cv2.boundingRect(c)[0]+cv2.boundingRect(c)[2]/2) <= 0.8*w)]
+            if valid_full:
+                product_contour = max(valid_full, key=cv2.contourArea)
+
         if bg_fg_mask is not None and product_contour is not None:
             img_fg = cv2.bitwise_and(img_in, img_in, mask=bg_fg_mask)
             lab_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2LAB)
@@ -279,57 +274,70 @@ class ImageProcessor:
 
             x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
 
-            # ── QUY CHUẨN MÀU SẮC THEO YÊU CẦU ──
-            # 1. Màu đồng (Copper):
-            #    - AntiqueWhite3: RGB (205, 192, 176) -> #CDC0B0 (Lab A>=124, B>=122, Hue 5-28)
-            #    - AntiqueWhite4: RGB (139, 131, 120) -> #8B8378 (Lab A>=123, B>=123, Saturation > 15)
-            # 2. Kim loại chung (Sắt + Đồng / Steel + Metallic Sheen):
-            #    - Bao gồm màu đồng + LightCyan4: RGB (122, 139, 139) -> #7A8B8B
-            #    - Honeydew3/4: RGB (193, 205, 193) -> #C1CDC1 & RGB (131, 139, 131) -> #838B83
+            rgb_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2RGB)
+            R_f = rgb_fg[:, :, 0].astype(int)
+            G_f = rgb_fg[:, :, 1].astype(int)
+            B_f = rgb_fg[:, :, 2].astype(int)
 
-            # Multishade precision copper mask (AntiqueWhite3/4 warm orange, tarnished, dark copper)
-            cop_orange = (H_f >= 2) & (H_f <= 28) & (S_f > 25) & (V_f > 30) & (V_f < 230)
-            cop_antiquewhite = (A_f >= 124) & (B_f >= 122) & (S_f > 18) & (L_f > 25) & (L_f < 175)
-            cop_dark = (A_f >= 123) & (B_f >= 123) & (S_f > 15) & (L_f < 155)
-            copper_raw = ((cop_orange | cop_antiquewhite | cop_dark) & (bg_fg_mask > 0)).astype(np.uint8) * 255
+            # ── QUY CHUẨN MÀU SẮC THEO YÊU CẦU ──
+            # 1. Màu đồng (Copper Palette):
+            #    - AntiqueWhite3: RGB (205, 192, 176) -> #CDC0B0
+            #    - AntiqueWhite4: RGB (139, 131, 120) -> #8B8378
+            #    - PeachPuff4:    RGB (139, 119, 101) -> #8B7765
+            #    - NavajoWhite4:  RGB (139, 121, 94)  -> #8B795E
+            #    - Sắc thái ấm đặc trưng: Red phải vượt trội so with Green & Blue (R > G và R > B + 10)
+            # 2. Kim loại chung (Sắt + Đồng / Steel + Metallic Sheen):
+            #    - LightCyan4: RGB (122, 139, 139) -> #7A8B8B (Phần kim loại có độ tối L < 165)
+            #    - Honeydew3/4: RGB (193, 205, 193) -> #C1CDC1 & RGB (131, 139, 131) -> #838B83
+            # 3. Phân biệt màu dây nhựa (LightCyan3):
+            #    - LightCyan3: RGB (180, 205, 205) -> #B4CDCD (Phần vỏ dây nhựa màu sáng L > 175)
+
+            # Multishade precision copper mask (AntiqueWhite3/4, PeachPuff4, NavajoWhite4 warm orange, tarnished, dark copper)
+            cop_orange = (H_f >= 2) & (H_f <= 28) & (S_f > 30) & (V_f > 40) & (V_f < 230)
+            cop_warm = (bg_fg_mask > 0) & (A_f >= 124) & (B_f >= 122) & (R_f > G_f) & (R_f > B_f + 10) & (S_f > 18) & (L_f > 25) & (L_f < 185)
+            copper_raw = ((cop_orange | cop_warm) & (bg_fg_mask > 0)).astype(np.uint8) * 255
 
             # Exclude stamped ring head text reflections (top 15% of product)
             copper_raw[:y_bb + int(h_bb * 0.15), :] = 0
             copper_raw[y_bb + int(h_bb * 0.55):, :] = 0
 
-            # Scan top-down to dynamically locate start of white wire insulation body
-            is_white_wire = (bg_fg_mask > 0) & (L_f > 200) & (S_f < 12) & (np.abs(A_f.astype(int) - 128) <= 2) & (np.abs(B_f.astype(int) - 128) <= 2)
-            metal_end_y = y_bb + int(h_bb * 0.45)
+            # Scan top-down to dynamically locate start of white/LightCyan3 wire insulation body
+            is_wire_insulation = (bg_fg_mask > 0) & (
+                ((L_f > 175) & (G_f > 160) & (B_f > 160) & (S_f < 35)) |
+                ((L_f > 195) & (S_f < 20))
+            )
+            metal_end_y = y_bb + h_bb
 
-            for r in range(y_bb + int(h_bb * 0.20), y_bb + int(h_bb * 0.60)):
+            for r in range(y_bb + int(h_bb * 0.20), y_bb + int(h_bb * 0.85)):
                 row_p = np.sum(bg_fg_mask[r, :] > 0)
-                row_w = np.sum(is_white_wire[r, :] > 0)
-                if row_p > 0 and (row_w / row_p) > 0.65:
-                    ratios = []
-                    for fr in range(r, min(r + 30, y_bb + h_bb)):
-                        fp = np.sum(bg_fg_mask[fr, :] > 0)
-                        fw = np.sum(is_white_wire[fr, :] > 0)
-                        if fp > 0: ratios.append(fw / fp)
-                    if len(ratios) >= 20 and np.mean(ratios) > 0.65:
+                row_w = np.sum(is_wire_insulation[r, :] > 0)
+                if row_p > 0 and (row_w / row_p) > 0.50:
+                    ratios = [np.sum(is_wire_insulation[fr, :] > 0)/np.sum(bg_fg_mask[fr, :] > 0) for fr in range(r, min(r + 20, y_bb + h_bb)) if np.sum(bg_fg_mask[fr, :] > 0) > 0]
+                    if len(ratios) >= 12 and np.mean(ratios) > 0.50:
                         metal_end_y = r
                         break
 
-            # Guarantee black border encloses all exposed bottom copper strands
+            # Guarantee black border encloses all exposed bottom copper strands, but does not enter wire insulation
             cop_ys, _ = np.where(copper_raw > 0)
             if len(cop_ys) > 0:
                 max_cop_y = np.max(cop_ys)
-                if max_cop_y + 8 > metal_end_y:
-                    metal_end_y = max_cop_y + 8
+                if max_cop_y + 2 > metal_end_y:
+                    metal_end_y = max_cop_y + 2
 
             metal_mask = np.zeros((h, w), dtype=np.uint8)
-            metal_mask[y_bb:metal_end_y, :] = bg_fg_mask[y_bb:metal_end_y, :]
+            metal_mask[y_bb:metal_end_y, :] = (bg_fg_mask[y_bb:metal_end_y, :] > 0) & (~is_wire_insulation[y_bb:metal_end_y, :])
 
-            k_m = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-            metal_cleaned = cv2.morphologyEx(metal_mask, cv2.MORPH_CLOSE, k_m, iterations=2)
-            m_cnts, _ = cv2.findContours(metal_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            temp_m = cv2.morphologyEx(metal_mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+            m_cnts, _ = cv2.findContours(temp_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             valid_m = [c for c in m_cnts if cv2.contourArea(c) > 500]
+
             if valid_m:
-                terminal_contour = max(valid_m, key=cv2.contourArea)
+                solid_m = np.zeros((h, w), dtype=np.uint8)
+                cv2.drawContours(solid_m, valid_m, -1, 255, -1)
+                solid_m = cv2.morphologyEx(solid_m, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+                m_cnts_final, _ = cv2.findContours(solid_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                if m_cnts_final:
+                    terminal_contour = max(m_cnts_final, key=cv2.contourArea)
 
             metal_area_px = cv2.contourArea(terminal_contour) if terminal_contour is not None else 1.0
             if metal_area_px <= 0:
@@ -339,7 +347,7 @@ class ImageProcessor:
             metal_h = metal_end_y - y_bb
             y_mid_band_start = y_bb + int(metal_h * 0.35)
             y_mid_band_end = y_bb + int(metal_h * 0.68)
-            y_bot_band_start = y_mid_band_end
+            y_bot_band_start = y_mid_band_end - 5
             y_bot_band_end = metal_end_y + 5
 
             # Band 1: Mid Copper Strip
@@ -348,7 +356,7 @@ class ImageProcessor:
             cop_mid_cleaned = cv2.morphologyEx(mask_mid, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
             cop_mid_cleaned = cv2.morphologyEx(cop_mid_cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3)))
             mid_cnts, _ = cv2.findContours(cop_mid_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            valid_mid = [c for c in mid_cnts if cv2.contourArea(c) > 15]
+            valid_mid = [c for c in mid_cnts if cv2.contourArea(c) > 25]
             if valid_mid:
                 all_pts = np.vstack(valid_mid)
                 mx, my, mw, mh = cv2.boundingRect(all_pts)
@@ -359,6 +367,7 @@ class ImageProcessor:
                 copper_boxes.append(box_tuple)
                 copper_details.append({
                     'box': box_tuple,
+                    'contours': valid_mid,
                     'area_px': m_area,
                     'ratio_pct': ratio_pct,
                     'pos_name': 'Copper Mid'
@@ -381,6 +390,7 @@ class ImageProcessor:
                 copper_boxes.append(box_tuple)
                 copper_details.append({
                     'box': box_tuple,
+                    'contours': valid_bot,
                     'area_px': b_area,
                     'ratio_pct': ratio_pct,
                     'pos_name': 'Copper Bot'
@@ -413,6 +423,7 @@ class ImageProcessor:
             terminal_contour=terminal_contour,
             copper_boxes=copper_boxes,
             metal_area_px=metal_area_px,
+            metal_end_y=metal_end_y,
             copper_details=copper_details,
             vis_steps=vis,
         )
@@ -560,10 +571,10 @@ class ImageProcessor:
         best_strategy = ""
 
         for name, raw_mask in candidate_masks:
-            # Triệt tiêu viền mép ngoài ảnh (tránh bắt phải lưới bàn ở sát mép)
+            # Triệt tiêu viền mép ngoài ảnh (loại bỏ hoàn toàn bóng gương tường/lưới gạch hai bên mép ảnh)
             mask_clean = raw_mask.copy()
-            margin_x = int(w * 0.06)
-            margin_y = int(h * 0.06)
+            margin_x = int(w * 0.22)
+            margin_y = int(h * 0.03)
             mask_clean[:, :margin_x] = 0
             mask_clean[:, (w - margin_x):] = 0
             mask_clean[:margin_y, :] = 0
@@ -583,6 +594,12 @@ class ImageProcessor:
 
             # Đánh giá TẤT CẢ contour đủ lớn, không chỉ lớn nhất
             for product in sorted(candidates, key=cv2.contourArea, reverse=True)[:3]:
+                bx_p, by_p, bw_p, bh_p = cv2.boundingRect(product)
+                cx_c = bx_p + bw_p / 2
+                # Bắt buộc sản phẩm phải nằm ở cột trung tâm ảnh (25% -> 75% chiều rộng ảnh)
+                if not (0.25 * w <= cx_c <= 0.75 * w):
+                    continue
+
                 area = cv2.contourArea(product)
 
                 # Aspect ratio
