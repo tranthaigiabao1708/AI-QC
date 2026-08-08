@@ -279,11 +279,19 @@ class ImageProcessor:
 
             x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
 
-            # Precision multi-shade copper mask (orange, tarnished, dark)
+            # ── QUY CHUẨN MÀU SẮC THEO YÊU CẦU ──
+            # 1. Màu đồng (Copper):
+            #    - AntiqueWhite3: RGB (205, 192, 176) -> #CDC0B0 (Lab A>=124, B>=122, Hue 5-28)
+            #    - AntiqueWhite4: RGB (139, 131, 120) -> #8B8378 (Lab A>=123, B>=123, Saturation > 15)
+            # 2. Kim loại chung (Sắt + Đồng / Steel + Metallic Sheen):
+            #    - Honeydew3: RGB (193, 205, 193) -> #C1CDC1
+            #    - Honeydew4: RGB (131, 139, 131) -> #838B83
+
+            # Multishade precision copper mask (AntiqueWhite3/4 warm orange, tarnished, dark copper)
             cop_orange = (H_f >= 2) & (H_f <= 28) & (S_f > 25) & (V_f > 30) & (V_f < 230)
-            cop_tarnished = (A_f >= 124) & (B_f >= 122) & (S_f > 18) & (L_f > 25) & (L_f < 175)
+            cop_antiquewhite = (A_f >= 124) & (B_f >= 122) & (S_f > 18) & (L_f > 25) & (L_f < 175)
             cop_dark = (A_f >= 123) & (B_f >= 123) & (S_f > 15) & (L_f < 155)
-            copper_raw = ((cop_orange | cop_tarnished | cop_dark) & (bg_fg_mask > 0)).astype(np.uint8) * 255
+            copper_raw = ((cop_orange | cop_antiquewhite | cop_dark) & (bg_fg_mask > 0)).astype(np.uint8) * 255
 
             # Exclude stamped ring head text reflections (top 15% of product)
             copper_raw[:y_bb + int(h_bb * 0.15), :] = 0
