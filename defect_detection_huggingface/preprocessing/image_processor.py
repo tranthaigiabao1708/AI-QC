@@ -285,21 +285,24 @@ class ImageProcessor:
             #    - AntiqueWhite4: RGB (139, 131, 120) -> #8B8378
             #    - PeachPuff4:    RGB (139, 119, 101) -> #8B7765
             #    - NavajoWhite4:  RGB (139, 121, 94)  -> #8B795E
-            #    - Sắc thái ấm đặc trưng: Red phải vượt trội so with Green & Blue (R > G và R > B + 10)
+            #    - Cornsilk4:     RGB (139, 136, 120) -> #8B8878 (Phổ màu củ đồng tản nhiệt/tarnished)
+            #    - Dark Warm Copper 1: RGBA (125, 119, 101)
+            #    - Dark Tarnished Copper 2: RGBA (62, 57, 40)
+            #    - Medium Tarnished Copper 3: RGBA (132, 127, 110)
+            #    - Sắc thái ấm đặc trưng: Red vượt trội so với Blue và tương đương/lớn hơn Green (R >= G - 1 và R > B + 4)
             # 2. Kim loại chung (Sắt + Đồng / Steel + Metallic Sheen):
             #    - LightCyan4: RGB (122, 139, 139) -> #7A8B8B (Phần kim loại có độ tối L < 165)
             #    - Honeydew3/4: RGB (193, 205, 193) -> #C1CDC1 & RGB (131, 139, 131) -> #838B83
             # 3. Phân biệt màu dây nhựa (LightCyan3):
             #    - LightCyan3: RGB (180, 205, 205) -> #B4CDCD (Phần vỏ dây nhựa màu sáng L > 175)
 
-            # Multishade precision copper mask (AntiqueWhite3/4, PeachPuff4, NavajoWhite4 warm orange, tarnished, dark copper)
+            # Multishade precision copper mask (AntiqueWhite3/4, PeachPuff4, NavajoWhite4, Cornsilk4, RGBA 125/119/101, 62/57/40, 132/127/110)
             cop_orange = (H_f >= 2) & (H_f <= 28) & (S_f > 30) & (V_f > 40) & (V_f < 230)
-            cop_warm = (bg_fg_mask > 0) & (A_f >= 124) & (B_f >= 122) & (R_f > G_f) & (R_f > B_f + 10) & (S_f > 18) & (L_f > 25) & (L_f < 185)
+            cop_warm = (bg_fg_mask > 0) & (A_f >= 122) & (B_f >= 119) & (R_f >= G_f - 1) & (R_f > B_f + 4) & (S_f > 10) & (L_f > 15) & (L_f < 190)
             copper_raw = ((cop_orange | cop_warm) & (bg_fg_mask > 0)).astype(np.uint8) * 255
 
             # Exclude stamped ring head text reflections (top 15% of product)
             copper_raw[:y_bb + int(h_bb * 0.15), :] = 0
-            copper_raw[y_bb + int(h_bb * 0.55):, :] = 0
 
             # Scan top-down to dynamically locate start of white/LightCyan3 wire insulation body
             is_wire_insulation = (bg_fg_mask > 0) & (
@@ -316,6 +319,9 @@ class ImageProcessor:
                     if len(ratios) >= 12 and np.mean(ratios) > 0.50:
                         metal_end_y = r
                         break
+
+            # Zero out any copper detected below metal_end_y + 10 in wire body
+            copper_raw[metal_end_y + 10:, :] = 0
 
             # Guarantee black border encloses all exposed bottom copper strands, but does not enter wire insulation
             cop_ys, _ = np.where(copper_raw > 0)
