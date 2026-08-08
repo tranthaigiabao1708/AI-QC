@@ -21,3 +21,5 @@ Thumbs.db
 # Model weights & ONNX exports (heavy binary files)
 defect_detection_huggingface/output/model/*.safetensors
 defect_detection_huggingface/output/*.onnx*
+defect_detection_huggingface/output/debug_*/
+defect_detection_huggingface/output/test_*/
