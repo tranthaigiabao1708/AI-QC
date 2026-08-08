@@ -260,39 +260,11 @@ class ImageProcessor:
                 epsilon = 0.001 * cv2.arcLength(c_best_sm, True)
                 smooth_contour = cv2.approxPolyDP(c_best_sm, epsilon, True)
 
-        # Tạo terminal_contour bo sát 100% ranh giới phần kim loại (sắt + đồng) trên ảnh đã remove BG
+        # ── DYNAMIC METALLIC BORDER (TERMINAL_CONTOUR) & MULTI-LOCATION COPPER ──
         terminal_contour = None
-        if bg_fg_mask is not None and product_contour is not None:
-            img_fg = cv2.bitwise_and(img_in, img_in, mask=bg_fg_mask)
-            lab_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2LAB)
-            hsv_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2HSV)
-
-            L_f = lab_fg[:, :, 0]
-            A_f = lab_fg[:, :, 1]
-            S_f = hsv_fg[:, :, 1]
-
-            is_metal = (bg_fg_mask > 0) & (L_f > 30) & ((L_f < 210) | (S_f > 18) | (A_f >= 123))
-            metal_mask = is_metal.astype(np.uint8) * 255
-
-            x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
-            metal_mask[y_bb + int(h_bb * 0.42):, :] = 0
-            metal_mask[:y_bb, :] = 0
-
-            k_m = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-            metal_cleaned = cv2.morphologyEx(metal_mask, cv2.MORPH_CLOSE, k_m, iterations=2)
-
-            m_cnts, _ = cv2.findContours(metal_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            valid_m = [c for c in m_cnts if cv2.contourArea(c) > 500]
-            if valid_m:
-                terminal_contour = max(valid_m, key=cv2.contourArea)
-
-        metal_area_px = cv2.contourArea(terminal_contour) if terminal_contour is not None else 1.0
-        if metal_area_px <= 0:
-            metal_area_px = 1.0
-
-        # Nhận diện tất cả các dải lõi đồng lộ và tính tỉ lệ diện tích % so với khung kim loại
         copper_boxes = []
         copper_details = []
+
         if bg_fg_mask is not None and product_contour is not None:
             img_fg = cv2.bitwise_and(img_in, img_in, mask=bg_fg_mask)
             lab_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2LAB)
@@ -305,38 +277,107 @@ class ImageProcessor:
             S_f = hsv_fg[:, :, 1]
             V_f = hsv_fg[:, :, 2]
 
-            copper_hsv = (H_f >= 2) & (H_f <= 28) & (S_f > 30) & (V_f < 230)
-            copper_greyed = (A_f >= 123) & (A_f > B_f - 3) & (L_f < 165) & (S_f > 12) & (bg_fg_mask > 0)
-            copper_comb = ((copper_hsv | copper_greyed) & (bg_fg_mask > 0)).astype(np.uint8) * 255
-
             x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
-            copper_comb[y_bb + int(h_bb * 0.42):, :] = 0
-            copper_comb[:y_bb, :] = 0
 
-            k_cop = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
-            copper_cleaned = cv2.morphologyEx(copper_comb, cv2.MORPH_CLOSE, k_cop, iterations=2)
+            # Precision multi-shade copper mask (orange, tarnished, dark)
+            cop_orange = (H_f >= 2) & (H_f <= 28) & (S_f > 25) & (V_f > 30) & (V_f < 230)
+            cop_tarnished = (A_f >= 124) & (B_f >= 122) & (S_f > 18) & (L_f > 25) & (L_f < 175)
+            cop_dark = (A_f >= 123) & (B_f >= 123) & (S_f > 15) & (L_f < 155)
+            copper_raw = ((cop_orange | cop_tarnished | cop_dark) & (bg_fg_mask > 0)).astype(np.uint8) * 255
 
-            cop_cnts, _ = cv2.findContours(copper_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            metal_y_mid = y_bb + int(h_bb * 0.25)
-            for c_c in cop_cnts:
-                c_area = cv2.contourArea(c_c)
-                if c_area > 8:
-                    cx_c, cy_c, cw_c, ch_c = cv2.boundingRect(c_c)
-                    margin_x = int(cw_c * 0.15) + 2
-                    cx_f = max(0, cx_c - margin_x)
-                    cw_f = cw_c + margin_x * 2
+            # Exclude stamped ring head text reflections (top 15% of product)
+            copper_raw[:y_bb + int(h_bb * 0.15), :] = 0
+            copper_raw[y_bb + int(h_bb * 0.55):, :] = 0
 
-                    ratio_pct = (c_area / metal_area_px) * 100.0
-                    pos_name = "Copper Mid" if cy_c < metal_y_mid else "Copper Bot"
+            # Scan top-down to dynamically locate start of white wire insulation body
+            is_white_wire = (bg_fg_mask > 0) & (L_f > 200) & (S_f < 12) & (np.abs(A_f.astype(int) - 128) <= 2) & (np.abs(B_f.astype(int) - 128) <= 2)
+            metal_end_y = y_bb + int(h_bb * 0.45)
 
-                    box_tuple = (cx_f, cy_c, cw_f, ch_c)
-                    copper_boxes.append(box_tuple)
-                    copper_details.append({
-                        'box': box_tuple,
-                        'area_px': c_area,
-                        'ratio_pct': ratio_pct,
-                        'pos_name': pos_name
-                    })
+            for r in range(y_bb + int(h_bb * 0.20), y_bb + int(h_bb * 0.60)):
+                row_p = np.sum(bg_fg_mask[r, :] > 0)
+                row_w = np.sum(is_white_wire[r, :] > 0)
+                if row_p > 0 and (row_w / row_p) > 0.65:
+                    ratios = []
+                    for fr in range(r, min(r + 30, y_bb + h_bb)):
+                        fp = np.sum(bg_fg_mask[fr, :] > 0)
+                        fw = np.sum(is_white_wire[fr, :] > 0)
+                        if fp > 0: ratios.append(fw / fp)
+                    if len(ratios) >= 20 and np.mean(ratios) > 0.65:
+                        metal_end_y = r
+                        break
+
+            # Guarantee black border encloses all exposed bottom copper strands
+            cop_ys, _ = np.where(copper_raw > 0)
+            if len(cop_ys) > 0:
+                max_cop_y = np.max(cop_ys)
+                if max_cop_y + 8 > metal_end_y:
+                    metal_end_y = max_cop_y + 8
+
+            metal_mask = np.zeros((h, w), dtype=np.uint8)
+            metal_mask[y_bb:metal_end_y, :] = bg_fg_mask[y_bb:metal_end_y, :]
+
+            k_m = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+            metal_cleaned = cv2.morphologyEx(metal_mask, cv2.MORPH_CLOSE, k_m, iterations=2)
+            m_cnts, _ = cv2.findContours(metal_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            valid_m = [c for c in m_cnts if cv2.contourArea(c) > 500]
+            if valid_m:
+                terminal_contour = max(valid_m, key=cv2.contourArea)
+
+            metal_area_px = cv2.contourArea(terminal_contour) if terminal_contour is not None else 1.0
+            if metal_area_px <= 0:
+                metal_area_px = 1.0
+
+            # 2-Band Spatial Copper Extraction (Mid vs Bot)
+            metal_h = metal_end_y - y_bb
+            y_mid_band_start = y_bb + int(metal_h * 0.35)
+            y_mid_band_end = y_bb + int(metal_h * 0.68)
+            y_bot_band_start = y_mid_band_end
+            y_bot_band_end = metal_end_y + 5
+
+            # Band 1: Mid Copper Strip
+            mask_mid = np.zeros((h, w), dtype=np.uint8)
+            mask_mid[y_mid_band_start:y_mid_band_end, :] = copper_raw[y_mid_band_start:y_mid_band_end, :]
+            cop_mid_cleaned = cv2.morphologyEx(mask_mid, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+            cop_mid_cleaned = cv2.morphologyEx(cop_mid_cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3)))
+            mid_cnts, _ = cv2.findContours(cop_mid_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid_mid = [c for c in mid_cnts if cv2.contourArea(c) > 15]
+            if valid_mid:
+                all_pts = np.vstack(valid_mid)
+                mx, my, mw, mh = cv2.boundingRect(all_pts)
+                m_area = sum(cv2.contourArea(c) for c in valid_mid)
+                ratio_pct = (m_area / metal_area_px) * 100.0
+                margin_x = int(mw * 0.08) + 2
+                box_tuple = (max(0, mx - margin_x), my, mw + margin_x * 2, mh)
+                copper_boxes.append(box_tuple)
+                copper_details.append({
+                    'box': box_tuple,
+                    'area_px': m_area,
+                    'ratio_pct': ratio_pct,
+                    'pos_name': 'Copper Mid'
+                })
+
+            # Band 2: Bot Copper Strip
+            mask_bot = np.zeros((h, w), dtype=np.uint8)
+            mask_bot[y_bot_band_start:y_bot_band_end, :] = copper_raw[y_bot_band_start:y_bot_band_end, :]
+            cop_bot_cleaned = cv2.morphologyEx(mask_bot, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+            cop_bot_cleaned = cv2.morphologyEx(cop_bot_cleaned, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3)))
+            bot_cnts, _ = cv2.findContours(cop_bot_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid_bot = [c for c in bot_cnts if cv2.contourArea(c) > 15]
+            if valid_bot:
+                all_pts = np.vstack(valid_bot)
+                bx, by, bw, bh = cv2.boundingRect(all_pts)
+                b_area = sum(cv2.contourArea(c) for c in valid_bot)
+                ratio_pct = (b_area / metal_area_px) * 100.0
+                margin_x = int(bw * 0.08) + 2
+                box_tuple = (max(0, bx - margin_x), by, bw + margin_x * 2, bh)
+                copper_boxes.append(box_tuple)
+                copper_details.append({
+                    'box': box_tuple,
+                    'area_px': b_area,
+                    'ratio_pct': ratio_pct,
+                    'pos_name': 'Copper Bot'
+                })
+
 
         # Tính pipeline confidence tổng thể
         pipeline_confidence = float(np.mean(confidence_scores)) if confidence_scores else 0.5
