@@ -284,8 +284,8 @@ class ImageProcessor:
             #    - AntiqueWhite3: RGB (205, 192, 176) -> #CDC0B0 (Lab A>=124, B>=122, Hue 5-28)
             #    - AntiqueWhite4: RGB (139, 131, 120) -> #8B8378 (Lab A>=123, B>=123, Saturation > 15)
             # 2. Kim loại chung (Sắt + Đồng / Steel + Metallic Sheen):
-            #    - Honeydew3: RGB (193, 205, 193) -> #C1CDC1
-            #    - Honeydew4: RGB (131, 139, 131) -> #838B83
+            #    - Bao gồm màu đồng + LightCyan4: RGB (122, 139, 139) -> #7A8B8B
+            #    - Honeydew3/4: RGB (193, 205, 193) -> #C1CDC1 & RGB (131, 139, 131) -> #838B83
 
             # Multishade precision copper mask (AntiqueWhite3/4 warm orange, tarnished, dark copper)
             cop_orange = (H_f >= 2) & (H_f <= 28) & (S_f > 25) & (V_f > 30) & (V_f < 230)
