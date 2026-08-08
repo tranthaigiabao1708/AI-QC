@@ -268,35 +268,38 @@ class ImageProcessor:
 
         x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
 
-        # Khung đen: bao quanh phần đầu cos kim loại
+        # Khung đen: bao quanh phần thân cos kim loại (crimp barrel)
         if h_bb >= w_bb:
-            t_y1 = y_bb + int(h_bb * 0.12)
+            t_y1 = y_bb + int(h_bb * 0.22)
             t_y2 = y_bb + int(h_bb * 0.38)
-            t_x1 = max(0, x_bb - 5)
-            t_x2 = min(w, x_bb + w_bb + 5)
+            t_x1 = max(0, x_bb - 4)
+            t_x2 = min(w, x_bb + w_bb + 4)
         else:
-            t_x1 = x_bb + int(w_bb * 0.12)
+            t_x1 = x_bb + int(w_bb * 0.22)
             t_x2 = x_bb + int(w_bb * 0.38)
-            t_y1 = max(0, y_bb - 5)
-            t_y2 = min(h, y_bb + h_bb + 5)
+            t_y1 = max(0, y_bb - 4)
+            t_y2 = min(h, y_bb + h_bb + 4)
 
         terminal_bbox = (t_x1, t_y1, t_x2, t_y2)
 
-        # Khung xanh/đỏ: bao quanh vùng đồng lộ ra trong đầu cos
+        # Khung xanh/đỏ: bao quanh toàn bộ dải đồng lộ ra ở đầu cos
         copper_bbox_orig = None
         roi_img = img[t_y1:t_y2, t_x1:t_x2]
         if roi_img.size > 0:
             roi_hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
             roi_lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
-            c_hsv = cv2.inRange(roi_hsv, np.array([5, 70, 40]), np.array([25, 255, 190]))
-            c_lab = ((roi_lab[:, :, 1] > 135) & (roi_lab[:, :, 2] > 135)).astype(np.uint8) * 255
+            c_hsv = cv2.inRange(roi_hsv, np.array([3, 35, 40]), np.array([25, 255, 230]))
+            c_lab = ((roi_lab[:, :, 1] > 125) & (roi_lab[:, :, 2] > 125)).astype(np.uint8) * 255
             c_comb = cv2.bitwise_or(c_hsv, c_lab)
 
+            k_copper = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+            c_comb = cv2.morphologyEx(c_comb, cv2.MORPH_CLOSE, k_copper, iterations=2)
+
             cnts, _ = cv2.findContours(c_comb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            valid = [c for c in cnts if cv2.contourArea(c) > 5]
+            valid = [c for c in cnts if cv2.contourArea(c) > 10]
             if valid:
-                c_best = max(valid, key=cv2.contourArea)
-                cx, cy, cw, ch = cv2.boundingRect(c_best)
+                all_pts = np.vstack(valid)
+                cx, cy, cw, ch = cv2.boundingRect(all_pts)
                 copper_bbox_orig = (t_x1 + cx, t_y1 + cy, t_x1 + cx + cw, t_y1 + cy + ch)
 
         return terminal_bbox, copper_bbox_orig
@@ -779,47 +782,37 @@ class ImageProcessor:
     # ──────────────────────────────────────────────────────────
     def _step6_crop_roi(self, standardized, std_mask, copper_w, copper_h,
                         h_std, w_std, copper_mask):
-        """Cắt ROI cuối cùng với fallback cải thiện."""
-        if copper_w > 0 and copper_h > 0:
-            pad = 10
-            y1 = max(0, self._last_copper_y - pad)
-            y2 = min(h_std, self._last_copper_y + copper_h + pad)
-            x1 = max(0, self._last_copper_x - pad)
-            x2 = min(w_std, self._last_copper_x + copper_w + pad)
-            roi_raw = standardized[y1:y2, x1:x2]
-            roi_std_mask = std_mask[y1:y2, x1:x2]
-            roi_copper_mask = copper_mask[y1:y2, x1:x2]
+        """Cắt ROI tập trung vào phần đầu cos kim loại (crimp barrel) và phóng to cho AI model."""
+        fg_cols = np.where(np.any(std_mask > 0, axis=0))[0]
+        fg_rows = np.where(np.any(std_mask > 0, axis=1))[0]
+
+        if len(fg_cols) > 0 and len(fg_rows) > 0:
+            x_length = fg_cols[-1] - fg_cols[0]
+            # Vùng crimp barrel chiếm khoảng 15%-45% chiều dài tính từ đầu cos
+            ix_l = fg_cols[0] + int(x_length * 0.12)
+            ix_r = fg_cols[0] + int(x_length * 0.45)
+            iy_t = max(0, fg_rows[0] - 5)
+            iy_b = min(h_std, fg_rows[-1] + 5)
         else:
-            # Fallback cải thiện: crop vùng trung tâm sản phẩm theo tỷ lệ
-            fg_cols = np.where(np.any(std_mask > 0, axis=0))[0]
-            fg_rows = np.where(np.any(std_mask > 0, axis=1))[0]
+            ix_l = int(w_std * 0.12)
+            ix_r = int(w_std * 0.45)
+            iy_t, iy_b = int(h_std * 0.15), int(h_std * 0.85)
 
-            if len(fg_cols) > 0 and len(fg_rows) > 0:
-                # Crop 30-60% chiều dài sản phẩm (vùng giữa có khả năng chứa đồng lộ)
-                x_range = fg_cols[-1] - fg_cols[0]
-                ix_l = fg_cols[0] + int(x_range * 0.15)
-                ix_r = fg_cols[0] + int(x_range * 0.55)
-                iy_t = max(0, fg_rows[0] - 5)
-                iy_b = min(h_std, fg_rows[-1] + 5)
-            else:
-                ix_l = int(w_std * 0.15)
-                ix_r = int(w_std * 0.50)
-                iy_t, iy_b = int(h_std * 0.2), int(h_std * 0.8)
-
-            roi_raw = standardized[iy_t:iy_b, ix_l:ix_r]
-            roi_std_mask = std_mask[iy_t:iy_b, ix_l:ix_r]
-            roi_copper_mask = copper_mask[iy_t:iy_b, ix_l:ix_r]
+        roi_raw = standardized[iy_t:iy_b, ix_l:ix_r]
+        roi_std_mask = std_mask[iy_t:iy_b, ix_l:ix_r]
+        roi_copper_mask = copper_mask[iy_t:iy_b, ix_l:ix_r]
 
         if roi_raw.size == 0:
-            return None, 0.0
+            return cv2.resize(standardized, self.target_size, interpolation=cv2.INTER_CUBIC), 0.0
 
-        # Tính tỷ lệ diện tích đồng trên toàn bộ diện tích sản phẩm (foreground) trong ảnh chuẩn hóa
-        # Dùng full std_mask thay vì ROI mask để tránh tỷ lệ bị phóng đại
-        total_copper_pixels = np.sum(copper_mask > 0)
-        total_product_pixels = max(np.sum(std_mask > 0), 1)
-        copper_ratio = float(total_copper_pixels / total_product_pixels)
+        # Tính tỷ lệ diện tích đồng trên diện tích phần thân cos kim loại (Crimp ROI)
+        total_copper_pixels = np.sum(roi_copper_mask > 0)
+        crimp_product_pixels = max(np.sum(roi_std_mask > 0), 1)
+        copper_ratio = float(total_copper_pixels / crimp_product_pixels)
 
-        return cv2.resize(roi_raw, self.target_size, interpolation=cv2.INTER_CUBIC), copper_ratio
+        # Phóng to ROI lên kích thước target (224x224) cho AI model suy luận
+        roi_zoomed = cv2.resize(roi_raw, self.target_size, interpolation=cv2.INTER_CUBIC)
+        return roi_zoomed, copper_ratio
 
     # ──────────────────────────────────────────────────────────
     # Helpers
