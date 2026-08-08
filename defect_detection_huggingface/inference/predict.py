@@ -219,8 +219,21 @@ class QualityInspector:
             tx1, ty1, tx2, ty2 = proc_result.terminal_bbox
             cv2.rectangle(vis_img, (tx1, ty1), (tx2, ty2), (0, 0, 0), 3)
 
-        # 3. Khung trong cùng (Xanh lá / Đỏ): Bao quanh tất cả dải đồng lộ ra ở cả 2 vị trí (ở giữa và ở dưới cùng phần kim loại)
-        if proc_result.copper_boxes:
+        # 3. Khung trong cùng (Xanh lá / Đỏ): Bao quanh tất cả dải đồng lộ ra & ghi tỉ lệ % diện tích so với khung kim loại
+        spec_ratios = []
+        if proc_result.copper_details:
+            for item in proc_result.copper_details:
+                (c_x, c_y, c_w, c_h) = item['box']
+                r_pct = item['ratio_pct']
+                p_name = item['pos_name']
+                cv2.rectangle(vis_img, (c_x, c_y), (c_x + c_w, c_y + c_h), color, 2)
+
+                # Vẽ nhãn % diện tích đồng ngay bên cạnh từng khung đồng
+                lbl = f"{p_name}: {r_pct:.2f}%"
+                cv2.putText(vis_img, lbl, (c_x + c_w + 10, c_y + c_h // 2 + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
+                spec_ratios.append(f"{p_name}={r_pct:.2f}%")
+        elif proc_result.copper_boxes:
             for (c_x, c_y, c_w, c_h) in proc_result.copper_boxes:
                 cv2.rectangle(vis_img, (c_x, c_y), (c_x + c_w, c_y + c_h), color, 2)
         elif proc_result.copper_pts is not None:
@@ -232,9 +245,10 @@ class QualityInspector:
         text = f"QC DECISION: {final_decision} ({effective_confidence:.1%})"
         cv2.putText(vis_img, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
 
+        ratio_summary = " | ".join(spec_ratios) if spec_ratios else f"Copper: {copper_ratio:.1%}"
         mode_text = "CV+AI" if self.has_trained_model else "CV-only"
-        spec_text = f"Copper: {copper_ratio:.1%} | Pipeline: {pipeline_conf:.0%} | Mode: {mode_text}"
-        cv2.putText(vis_img, spec_text, (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        spec_text = f"Ratios: {ratio_summary} | Metal: {int(proc_result.metal_area_px)}px2 | Mode: {mode_text}"
+        cv2.putText(vis_img, spec_text, (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
 
         return {
             "success": True,

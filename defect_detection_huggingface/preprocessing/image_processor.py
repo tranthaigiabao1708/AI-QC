@@ -50,7 +50,9 @@ class ProcessingResult:
     copper_pts: Optional[np.ndarray] = None    # (4, 2) Đỉnh khung xanh xoay (vùng đồng)
     smooth_contour: Optional[np.ndarray] = None # Contour bo sát toàn bộ sản phẩm sau tách nền
     terminal_contour: Optional[np.ndarray] = None # Contour bo sát phần kim loại (sắt + đồng)
-    copper_boxes: List[Tuple[int, int, int, int]] = field(default_factory=list) # Danh sách (x, y, w, h) các dải đồng phát hiện được (ở giữa & ở dưới)
+    copper_boxes: List[Tuple[int, int, int, int]] = field(default_factory=list) # Danh sách (x, y, w, h) các dải đồng
+    metal_area_px: float = 0.0 # Diện tích phần kim loại (border đen) tính theo px2
+    copper_details: List[Dict[str, Any]] = field(default_factory=list) # Danh sách chứa thông tin tỉ lệ % từng vùng đồng
 
     # Ảnh trực quan hóa từng bước
     vis_steps: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -284,8 +286,13 @@ class ImageProcessor:
             if valid_m:
                 terminal_contour = max(valid_m, key=cv2.contourArea)
 
-        # Nhận diện tất cả các dải lõi đồng lộ (ở cả 2 phía: ở giữa và ở dưới cùng phần kim loại)
+        metal_area_px = cv2.contourArea(terminal_contour) if terminal_contour is not None else 1.0
+        if metal_area_px <= 0:
+            metal_area_px = 1.0
+
+        # Nhận diện tất cả các dải lõi đồng lộ và tính tỉ lệ diện tích % so với khung kim loại
         copper_boxes = []
+        copper_details = []
         if bg_fg_mask is not None and product_contour is not None:
             img_fg = cv2.bitwise_and(img_in, img_in, mask=bg_fg_mask)
             lab_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2LAB)
@@ -310,13 +317,26 @@ class ImageProcessor:
             copper_cleaned = cv2.morphologyEx(copper_comb, cv2.MORPH_CLOSE, k_cop, iterations=2)
 
             cop_cnts, _ = cv2.findContours(copper_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            metal_y_mid = y_bb + int(h_bb * 0.25)
             for c_c in cop_cnts:
-                if cv2.contourArea(c_c) > 8:
+                c_area = cv2.contourArea(c_c)
+                if c_area > 8:
                     cx_c, cy_c, cw_c, ch_c = cv2.boundingRect(c_c)
                     margin_x = int(cw_c * 0.15) + 2
                     cx_f = max(0, cx_c - margin_x)
                     cw_f = cw_c + margin_x * 2
-                    copper_boxes.append((cx_f, cy_c, cw_f, ch_c))
+
+                    ratio_pct = (c_area / metal_area_px) * 100.0
+                    pos_name = "Copper Mid" if cy_c < metal_y_mid else "Copper Bot"
+
+                    box_tuple = (cx_f, cy_c, cw_f, ch_c)
+                    copper_boxes.append(box_tuple)
+                    copper_details.append({
+                        'box': box_tuple,
+                        'area_px': c_area,
+                        'ratio_pct': ratio_pct,
+                        'pos_name': pos_name
+                    })
 
         # Tính pipeline confidence tổng thể
         pipeline_confidence = float(np.mean(confidence_scores)) if confidence_scores else 0.5
@@ -343,6 +363,8 @@ class ImageProcessor:
             smooth_contour=smooth_contour,
             terminal_contour=terminal_contour,
             copper_boxes=copper_boxes,
+            metal_area_px=metal_area_px,
+            copper_details=copper_details,
             vis_steps=vis,
         )
 
