@@ -199,22 +199,26 @@ class QualityInspector:
                 effective_confidence = pipeline_conf * 0.7
             color = (0, 255, 0) if final_decision == "OK" else (0, 0, 255)
 
-        # 4. Vẽ trực quan hóa 3 khung trên ảnh gốc theo chuẩn yêu cầu
+        # 4. Vẽ trực quan hóa 3 khung xoay đồng góc (minAreaRect-aligned) trên ảnh gốc
         vis_img = img_bgr.copy()
 
-        # 1. Khung ngoài cùng (Xanh lá): Bao quanh toàn bộ sản phẩm
+        # 1. Khung ngoài cùng (Xanh lá): Bao quanh toàn bộ sản phẩm (Rotated Rect)
         if proc_result.outer_rect is not None:
             box = cv2.boxPoints(proc_result.outer_rect)
             box = np.intp(box)
             cv2.drawContours(vis_img, [box], 0, (0, 255, 0), 3)
 
-        # 2. Khung giữa (Đen): Bao quanh phần đầu cos kim loại
-        if proc_result.terminal_bbox is not None:
+        # 2. Khung giữa (Đen): Bao quanh phần thân cos kim loại (NẰM HOÀN TOÀN TRONG KHUNG MẸ)
+        if proc_result.terminal_pts is not None:
+            cv2.drawContours(vis_img, [proc_result.terminal_pts], 0, (0, 0, 0), 3)
+        elif proc_result.terminal_bbox is not None:
             tx1, ty1, tx2, ty2 = proc_result.terminal_bbox
             cv2.rectangle(vis_img, (tx1, ty1), (tx2, ty2), (0, 0, 0), 3)
 
-        # 3. Khung trong cùng (Xanh lá / Đỏ): Bao quanh vùng đồng lộ ra
-        if proc_result.copper_bbox_orig is not None:
+        # 3. Khung trong cùng (Xanh lá / Đỏ): Bao quanh dải đồng lộ ra ở khớp nối
+        if proc_result.copper_pts is not None:
+            cv2.drawContours(vis_img, [proc_result.copper_pts], 0, color, 2)
+        elif proc_result.copper_bbox_orig is not None:
             cx1, cy1, cx2, cy2 = proc_result.copper_bbox_orig
             cv2.rectangle(vis_img, (cx1, cy1), (cx2, cy2), color, 2)
 

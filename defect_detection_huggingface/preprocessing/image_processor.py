@@ -44,8 +44,10 @@ class ProcessingResult:
     pipeline_confidence: float = 1.0         # Mức tin cậy tổng thể pipeline (0.0-1.0)
     product_length: int = 0                  # Chiều dài sản phẩm đo được (px)
     centroid: Tuple[int, int] = (0, 0)       # Tâm sản phẩm trên ảnh gốc (cho tracking)
-    terminal_bbox: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2) khung đen đầu cos
-    copper_bbox_orig: Optional[Tuple[int, int, int, int]] = None # (x1, y1, x2, y2) khung xanh vùng đồng
+    terminal_bbox: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2)
+    copper_bbox_orig: Optional[Tuple[int, int, int, int]] = None
+    terminal_pts: Optional[np.ndarray] = None  # (4, 2) Đỉnh khung đen xoay (crimp barrel)
+    copper_pts: Optional[np.ndarray] = None    # (4, 2) Đỉnh khung xanh xoay (vùng đồng)
 
     # Ảnh trực quan hóa từng bước
     vis_steps: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -239,9 +241,9 @@ class ImageProcessor:
         # Tính pipeline confidence tổng thể
         pipeline_confidence = float(np.mean(confidence_scores)) if confidence_scores else 0.5
 
-        # Tính bboxes phục vụ trực quan hóa 3 khung (khung đen đầu cos & khung xanh vùng đồng)
-        terminal_bbox, copper_bbox_orig = self._get_visualization_bboxes(
-            img_in, product_contour, h, w
+        # Tính bboxes phục vụ trực quan hóa 3 khung xoay đồng góc (minAreaRect-aligned)
+        terminal_pts, copper_pts = self._get_visualization_bboxes(
+            img_in, product_contour, outer_rect, h, w
         )
 
         return ProcessingResult(
@@ -256,83 +258,58 @@ class ImageProcessor:
             pipeline_confidence=pipeline_confidence,
             product_length=int(length),
             centroid=centroid,
-            terminal_bbox=terminal_bbox,
-            copper_bbox_orig=copper_bbox_orig,
+            terminal_pts=terminal_pts,
+            copper_pts=copper_pts,
             vis_steps=vis,
         )
 
-    def _get_visualization_bboxes(self, img, product_contour, h, w):
-        """Tính khung đen (đầu cos kim loại) NẰM HOÀN TOÀN TRONG khung mẹ và khung xanh/đỏ (vùng đồng lộ)."""
-        if product_contour is None:
+    def _get_visualization_bboxes(self, img, product_contour, outer_rect, h, w):
+        """Tính 3 khung xoay đồng góc (minAreaRect-aligned) đảm bảo 100% nằm lùi gọn trong khung mẹ."""
+        if product_contour is None or outer_rect is None:
             return None, None
 
-        x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
+        # 1. Khung đen xoay góc (crimp barrel): 22%-37% chiều dài, w_factor=0.92 (nằm gọn trong khung mẹ)
+        _, crimp_pts = self._get_rotated_sub_box(outer_rect, 0.22, 0.37, w_factor=0.92)
 
-        # 1. Khung đen: Bao quanh phần thân cos kim loại (crimp barrel), ép NẰM HOÀN TOÀN TRONG khung mẹ
-        if h_bb >= w_bb:
-            t_y1 = y_bb + int(h_bb * 0.22)
-            t_y2 = y_bb + int(h_bb * 0.37)
+        # 2. Khung xanh xoay góc (copper strip): 22%-27% chiều dài, w_factor=0.85 (bao trọn dải đồng)
+        _, copper_pts = self._get_rotated_sub_box(outer_rect, 0.22, 0.27, w_factor=0.85)
+
+        return crimp_pts, copper_pts
+
+    def _get_rotated_sub_box(self, rect, y_frac_start, y_frac_end, w_factor=0.95):
+        """Tính khung chữ nhật xoay (Oriented Bounding Box) nằm gọn bên trong khung minAreaRect mẹ."""
+        (cx, cy), (w_r, h_r), angle = rect
+
+        if w_r > h_r:
+            long_len, short_len = w_r, h_r
+            axis_angle = angle
+            is_w_long = True
         else:
-            t_y1 = y_bb + int(h_bb * 0.22)
-            t_y2 = y_bb + int(h_bb * 0.37)
+            long_len, short_len = h_r, w_r
+            axis_angle = angle + 90
+            is_w_long = False
 
-        # Tạo mask của product contour tại dải y của crimp barrel để ép x1, x2 nằm hẳn bên trong
-        cnt_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(cnt_mask, [product_contour], -1, 255, -1)
-        crimp_strip_mask = cnt_mask[t_y1:t_y2, :]
+        rad = np.radians(axis_angle)
+        dir_x = np.cos(rad)
+        dir_y = np.sin(rad)
 
-        cols_in_strip = np.where(np.any(crimp_strip_mask > 0, axis=0))[0]
-        if len(cols_in_strip) > 0:
-            t_x1 = cols_in_strip[0] + 2
-            t_x2 = cols_in_strip[-1] - 2
+        sub_long_start = -long_len / 2 + long_len * y_frac_start
+        sub_long_end = -long_len / 2 + long_len * y_frac_end
+
+        sub_center_offset = (sub_long_start + sub_long_end) / 2
+        sub_height = sub_long_end - sub_long_start
+        sub_width = short_len * w_factor
+
+        sub_cx = cx + sub_center_offset * dir_x
+        sub_cy = cy + sub_center_offset * dir_y
+
+        if is_w_long:
+            sub_rect = ((sub_cx, sub_cy), (sub_height, sub_width), angle)
         else:
-            t_x1, t_x2 = x_bb + 2, x_bb + w_bb - 2
+            sub_rect = ((sub_cx, sub_cy), (sub_width, sub_height), angle)
 
-        terminal_bbox = (t_x1, t_y1, t_x2, t_y2)
-
-        # 2. Khung xanh/đỏ: Bao trọn toàn bộ dải đồng lộ tại khớp nối (kể cả màu đồng bị xám do ánh sáng)
-        copper_bbox_orig = None
-        roi_img = img[t_y1:t_y2, t_x1:t_x2]
-        c_roi_mask = cnt_mask[t_y1:t_y2, t_x1:t_x2]
-
-        if roi_img.size > 0:
-            r_lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
-            r_hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-
-            L = r_lab[:, :, 0]
-            A = r_lab[:, :, 1]
-            B = r_lab[:, :, 2]
-            H_c = r_hsv[:, :, 0]
-            S_c = r_hsv[:, :, 1]
-            V_c = r_hsv[:, :, 2]
-
-            # Phân tách màu đồng nhạy hơn với ánh sáng thực tế (đồng rực + đồng bị xám/tối)
-            c_hsv = (H_c >= 2) & (H_c <= 28) & (S_c > 30) & (V_c < 230)
-            c_greyed = (A >= 123) & (A > B - 3) & (L < 165) & (S_c > 12) & (c_roi_mask > 0)
-            c_comb = (c_hsv | c_greyed).astype(np.uint8) * 255
-
-            # Chỉ tập trung ở vùng khớp nối đỉnh (0-40% chiều cao Crimp ROI)
-            crimp_h = roi_img.shape[0]
-            c_comb[int(crimp_h * 0.40):, :] = 0
-
-            k_copper = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
-            c_comb = cv2.morphologyEx(c_comb, cv2.MORPH_CLOSE, k_copper, iterations=2)
-
-            cnts, _ = cv2.findContours(c_comb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            valid = [c for c in cnts if cv2.contourArea(c) > 10]
-            if valid:
-                all_pts = np.vstack(valid)
-                cx_c, cy_c, cw_c, ch_c = cv2.boundingRect(all_pts)
-
-                margin_x = int(roi_img.shape[1] * 0.08)
-                cx_final = max(2, cx_c - margin_x)
-                cw_final = min(roi_img.shape[1] - cx_final - 2, cw_c + margin_x * 2)
-                cy_final = max(1, cy_c - 1)
-                ch_final = ch_c + 2
-
-                copper_bbox_orig = (t_x1 + cx_final, t_y1 + cy_final, t_x1 + cx_final + cw_final, t_y1 + cy_final + ch_final)
-
-        return terminal_bbox, copper_bbox_orig
+        pts = cv2.boxPoints(sub_rect).astype(int)
+        return sub_rect, pts
 
     # ──────────────────────────────────────────────────────────
     # Bước 1: Tách nền bền vững (HSV-based + Otsu)
