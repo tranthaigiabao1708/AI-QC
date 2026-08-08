@@ -199,13 +199,24 @@ class QualityInspector:
                 effective_confidence = pipeline_conf * 0.7
             color = (0, 255, 0) if final_decision == "OK" else (0, 0, 255)
 
-        # 4. Vẽ trực quan hóa trên ảnh gốc
+        # 4. Vẽ trực quan hóa 3 khung trên ảnh gốc theo chuẩn yêu cầu
         vis_img = img_bgr.copy()
 
+        # 1. Khung ngoài cùng (Xanh lá): Bao quanh toàn bộ sản phẩm
         if proc_result.outer_rect is not None:
             box = cv2.boxPoints(proc_result.outer_rect)
             box = np.intp(box)
-            cv2.drawContours(vis_img, [box], 0, color, 3)
+            cv2.drawContours(vis_img, [box], 0, (0, 255, 0), 3)
+
+        # 2. Khung giữa (Đen): Bao quanh phần đầu cos kim loại
+        if proc_result.terminal_bbox is not None:
+            tx1, ty1, tx2, ty2 = proc_result.terminal_bbox
+            cv2.rectangle(vis_img, (tx1, ty1), (tx2, ty2), (0, 0, 0), 3)
+
+        # 3. Khung trong cùng (Xanh lá / Đỏ): Bao quanh vùng đồng lộ ra
+        if proc_result.copper_bbox_orig is not None:
+            cx1, cy1, cx2, cy2 = proc_result.copper_bbox_orig
+            cv2.rectangle(vis_img, (cx1, cy1), (cx2, cy2), color, 2)
 
         text = f"QC DECISION: {final_decision} ({effective_confidence:.1%})"
         cv2.putText(vis_img, text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)

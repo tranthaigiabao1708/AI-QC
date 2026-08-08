@@ -44,6 +44,8 @@ class ProcessingResult:
     pipeline_confidence: float = 1.0         # Mức tin cậy tổng thể pipeline (0.0-1.0)
     product_length: int = 0                  # Chiều dài sản phẩm đo được (px)
     centroid: Tuple[int, int] = (0, 0)       # Tâm sản phẩm trên ảnh gốc (cho tracking)
+    terminal_bbox: Optional[Tuple[int, int, int, int]] = None  # (x1, y1, x2, y2) khung đen đầu cos
+    copper_bbox_orig: Optional[Tuple[int, int, int, int]] = None # (x1, y1, x2, y2) khung xanh vùng đồng
 
     # Ảnh trực quan hóa từng bước
     vis_steps: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -237,6 +239,11 @@ class ImageProcessor:
         # Tính pipeline confidence tổng thể
         pipeline_confidence = float(np.mean(confidence_scores)) if confidence_scores else 0.5
 
+        # Tính bboxes phục vụ trực quan hóa 3 khung (khung đen đầu cos & khung xanh vùng đồng)
+        terminal_bbox, copper_bbox_orig = self._get_visualization_bboxes(
+            img_in, product_contour, h, w
+        )
+
         return ProcessingResult(
             roi=roi_final,
             copper_w=copper_w,
@@ -249,8 +256,50 @@ class ImageProcessor:
             pipeline_confidence=pipeline_confidence,
             product_length=int(length),
             centroid=centroid,
+            terminal_bbox=terminal_bbox,
+            copper_bbox_orig=copper_bbox_orig,
             vis_steps=vis,
         )
+
+    def _get_visualization_bboxes(self, img, product_contour, h, w):
+        """Tính khung đen (đầu cos kim loại) và khung xanh/đỏ (vùng đồng) trên tọa độ ảnh gốc."""
+        if product_contour is None:
+            return None, None
+
+        x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
+
+        # Khung đen: bao quanh phần đầu cos kim loại
+        if h_bb >= w_bb:
+            t_y1 = y_bb + int(h_bb * 0.12)
+            t_y2 = y_bb + int(h_bb * 0.38)
+            t_x1 = max(0, x_bb - 5)
+            t_x2 = min(w, x_bb + w_bb + 5)
+        else:
+            t_x1 = x_bb + int(w_bb * 0.12)
+            t_x2 = x_bb + int(w_bb * 0.38)
+            t_y1 = max(0, y_bb - 5)
+            t_y2 = min(h, y_bb + h_bb + 5)
+
+        terminal_bbox = (t_x1, t_y1, t_x2, t_y2)
+
+        # Khung xanh/đỏ: bao quanh vùng đồng lộ ra trong đầu cos
+        copper_bbox_orig = None
+        roi_img = img[t_y1:t_y2, t_x1:t_x2]
+        if roi_img.size > 0:
+            roi_hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+            roi_lab = cv2.cvtColor(roi_img, cv2.COLOR_BGR2LAB)
+            c_hsv = cv2.inRange(roi_hsv, np.array([5, 70, 40]), np.array([25, 255, 190]))
+            c_lab = ((roi_lab[:, :, 1] > 135) & (roi_lab[:, :, 2] > 135)).astype(np.uint8) * 255
+            c_comb = cv2.bitwise_or(c_hsv, c_lab)
+
+            cnts, _ = cv2.findContours(c_comb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid = [c for c in cnts if cv2.contourArea(c) > 5]
+            if valid:
+                c_best = max(valid, key=cv2.contourArea)
+                cx, cy, cw, ch = cv2.boundingRect(c_best)
+                copper_bbox_orig = (t_x1 + cx, t_y1 + cy, t_x1 + cx + cw, t_y1 + cy + ch)
+
+        return terminal_bbox, copper_bbox_orig
 
     # ──────────────────────────────────────────────────────────
     # Bước 1: Tách nền bền vững (HSV-based + Otsu)
@@ -287,6 +336,14 @@ class ImageProcessor:
         if blue_ratio > 0.15:
             fg1 = cv2.bitwise_not(blue_mask)
             candidate_masks.append(("blue_bg", fg1))
+
+        # ── Chiến lược 1b: Nền xanh lá / mint paper (MỚI) ──
+        a_channel = lab[:, :, 1]
+        b_channel = lab[:, :, 2]
+        green_paper_mask = ((a_channel < 118) & (b_channel > 120)).astype(np.uint8) * 255
+        green_ratio = np.sum(green_paper_mask > 0) / (h * w)
+        if green_ratio > 0.15:
+            candidate_masks.append(("green_mint_bg", cv2.bitwise_not(green_paper_mask)))
 
         # ── Chiến lược 2: Phát hiện dây trắng + kim loại ──
         l_channel = lab[:, :, 0]
@@ -334,13 +391,22 @@ class ImageProcessor:
         kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
         best_product = None
-        best_score = -1
+        best_score = -1e9
         best_mask = None
         best_strategy = ""
 
         for name, raw_mask in candidate_masks:
+            # Triệt tiêu viền mép ngoài ảnh (tránh bắt phải lưới bàn ở sát mép)
+            mask_clean = raw_mask.copy()
+            margin_x = int(w * 0.06)
+            margin_y = int(h * 0.06)
+            mask_clean[:, :margin_x] = 0
+            mask_clean[:, (w - margin_x):] = 0
+            mask_clean[:margin_y, :] = 0
+            mask_clean[(h - margin_y):, :] = 0
+
             # Morphological cleanup
-            cleaned = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel_close, iterations=3)
+            cleaned = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel_close, iterations=3)
             cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel_open, iterations=2)
 
             contours, _ = cv2.findContours(
@@ -403,13 +469,18 @@ class ImageProcessor:
                 else:
                     score -= 30  # Gần như không có edge = có thể là nền trơn
 
-                # ═══ VỊ TRÍ: phạt contour nằm sát mép trên/dưới ảnh ═══
-                # Nhãn giấy/label strip thường nằm sát mép trên hoặc dưới
+                # ═══ VỊ TRÍ: ưu tiên contour nằm ở trung tâm ảnh, phạt sát mép ═══
                 x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product)
+                center_x = x_bb + w_bb / 2
                 center_y = y_bb + h_bb / 2
-                # Sản phẩm nên nằm trong vùng giữa ảnh (20%-80% chiều cao)
+
+                if 0.20 * w <= center_x <= 0.80 * w:
+                    score += 50  # Nằm trong vùng chụp sản phẩm ở giữa
+                else:
+                    score -= 100  # Phạt nặng nếu ở mép ngoài cùng trái/phải (lưới bàn)
+
                 if center_y < h * 0.15 or center_y > h * 0.85:
-                    score -= 60  # Phạt nặng nếu sát mép
+                    score -= 60  # Phạt nặng nếu sát mép trên/dưới
                 elif center_y < h * 0.25 or center_y > h * 0.75:
                     score -= 20
 
