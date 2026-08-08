@@ -126,11 +126,19 @@ class ImageProcessor:
 
         if self.detector is not None:
             det_result = self.detector.detect(img_in)
-            if det_result is not None and det_result['confidence'] > 0.3:
-                fg_mask = det_result['mask']
-                product_contour = det_result['contour']
-                conf1 = det_result['confidence']
-                detection_method = f"feature-match ({det_result['ref_name']}, {det_result['match_count']} matches)"
+            if det_result is not None and det_result['confidence'] > 0.5:
+                # Validate: kiểm tra vị trí và kích thước để loại label strip
+                bx, by, bw, bh = det_result['bbox']
+                center_y = by + bh / 2
+                min_dim = min(bw, bh)
+                # Reject nếu: (1) sát mép trên/dưới ảnh, hoặc (2) quá mỏng
+                is_valid_position = h * 0.15 < center_y < h * 0.85
+                is_valid_thickness = min_dim > h * 0.05
+                if is_valid_position and is_valid_thickness:
+                    fg_mask = det_result['mask']
+                    product_contour = det_result['contour']
+                    conf1 = det_result['confidence']
+                    detection_method = f"feature-match ({det_result['ref_name']}, {det_result['match_count']} matches)"
 
         # Fallback: rule-based nếu feature matching thất bại
         if fg_mask is None:
@@ -395,6 +403,24 @@ class ImageProcessor:
                 else:
                     score -= 30  # Gần như không có edge = có thể là nền trơn
 
+                # ═══ VỊ TRÍ: phạt contour nằm sát mép trên/dưới ảnh ═══
+                # Nhãn giấy/label strip thường nằm sát mép trên hoặc dưới
+                x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product)
+                center_y = y_bb + h_bb / 2
+                # Sản phẩm nên nằm trong vùng giữa ảnh (20%-80% chiều cao)
+                if center_y < h * 0.15 or center_y > h * 0.85:
+                    score -= 60  # Phạt nặng nếu sát mép
+                elif center_y < h * 0.25 or center_y > h * 0.75:
+                    score -= 20
+
+                # ═══ ĐỘ DÀY TỐI THIỂU: loại contour quá mỏng (label strip) ═══
+                # Sản phẩm cos đồng có độ dày đáng kể, label chỉ vài chục pixel
+                min_dim = min(rect_w, rect_h)
+                if min_dim < h * 0.05:  # Mỏng hơn 5% chiều cao ảnh
+                    score -= 50
+                elif min_dim < h * 0.08:
+                    score -= 20
+
                 if score > best_score:
                     best_score = score
                     best_product = product
@@ -504,19 +530,20 @@ class ImageProcessor:
         thick1 = self._measure_thickness(fg_mask, *pt1, nx, ny)
         thick2 = self._measure_thickness(fg_mask, *pt2, nx, ny)
 
-        # Quyết định hướng: đầu cos = đầu sáng hơn VÀ dày hơn
-        # Nếu 2 phương pháp đồng ý → tin cậy cao; nếu không → ưu tiên brightness
+        # Quyết định hướng: đầu cos = đầu DÀY HƠN (ring terminal luôn rộng hơn dây)
+        # Brightness chỉ dùng khi thickness bằng nhau
+        # Lưu ý: ở ảnh thực tế, dây trắng PVC sáng hơn đầu cos kim loại
         brightness_vote = 1 if brightness1 > brightness2 else -1
         thickness_vote = 1 if thick1 > thick2 else -1
 
         is_flipped = False
-        if brightness_vote == -1:
-            # Đầu 2 sáng hơn → đổi hướng
+        if thickness_vote == -1:
+            # Đầu 2 dày hơn → đổi hướng (đầu cos phải nằm bên phải)
             dx, dy = -dx, -dy
             long_angle += 180
             is_flipped = True
-        elif brightness_vote == 0 and thickness_vote == -1:
-            # Brightness bằng nhau → dùng thickness
+        elif thickness_vote == 0 and brightness_vote == -1:
+            # Thickness bằng nhau → dùng brightness làm tiebreaker
             dx, dy = -dx, -dy
             long_angle += 180
             is_flipped = True
@@ -553,7 +580,7 @@ class ImageProcessor:
     def _step4_standardize_adaptive(self, cropped, cropped_mask, product_length):
         """
         Cắt chuẩn hóa theo tỷ lệ chiều dài sản phẩm thay vì pixel cố định.
-        Đảm bảo vùng crop bao phủ đầu cos + vùng crimp + phần dây.
+        Tự động xác định đầu cos (dày hơn) vs đầu dây (mỏng hơn).
         """
         h_c, w_c = cropped.shape[:2]
         col_has_fg = np.any(cropped_mask > 0, axis=0)
@@ -569,9 +596,29 @@ class ImageProcessor:
         # Fallback: nếu crop_length quá nhỏ, dùng fixed_crop_length
         crop_length = max(crop_length, min(self.fixed_crop_length, actual_length))
 
-        x_tip = fg_cols[-1]
-        x_start = max(0, x_tip - crop_length)
-        x_end = min(w_c, x_tip + 5)
+        # Xác định đầu cos: so sánh độ dày ở 2 đầu (đầu cos có ring → dày hơn)
+        left_x = fg_cols[0] + min(30, actual_length // 6)
+        right_x = fg_cols[-1] - min(30, actual_length // 6)
+        
+        # Đo thickness ở đầu trái
+        left_col = cropped_mask[:, max(0, left_x - 5):left_x + 5]
+        left_thickness = np.sum(np.any(left_col > 0, axis=1))
+        
+        # Đo thickness ở đầu phải
+        right_col = cropped_mask[:, max(0, right_x - 5):right_x + 5]
+        right_thickness = np.sum(np.any(right_col > 0, axis=1))
+        
+        # Đầu cos = đầu dày hơn
+        if left_thickness >= right_thickness:
+            # Terminal ở bên trái → crop từ trái
+            x_tip = fg_cols[0]
+            x_start = max(0, x_tip - 5)
+            x_end = min(w_c, x_start + crop_length)
+        else:
+            # Terminal ở bên phải → crop từ phải
+            x_tip = fg_cols[-1]
+            x_start = max(0, x_tip - crop_length)
+            x_end = min(w_c, x_tip + 5)
 
         std = cropped[:, x_start:x_end]
         std_mask = cropped_mask[:, x_start:x_end]
@@ -581,84 +628,43 @@ class ImageProcessor:
         return std, std_mask
 
     # ──────────────────────────────────────────────────────────
-    # Bước 5: Phát hiện đồng lộ bằng K-means + multi-colorspace
+    # Bước 5: Phát hiện đồng lộ bằng HSV + LAB direct range
     # ──────────────────────────────────────────────────────────
     def _step5_detect_copper_adaptive(self, standardized, std_mask, h_std, w_std):
         """
-        Phát hiện vùng đồng lộ bằng K-means clustering thay vì ngưỡng cứng.
-        Kết hợp xác nhận từ nhiều color space (LAB, HSV, YCrCb).
+        Phát hiện vùng đồng lộ bằng ngưỡng HSV + LAB trực tiếp.
+        Đơn giản, ổn định và chính xác hơn K-means cho ảnh thực tế.
         """
         self._last_copper_x = 0
         self._last_copper_y = 0
 
-        # Giới hạn vùng tìm kiếm (phần đầu sản phẩm)
-        search_x = int(w_std * self.search_region_ratio)
-
-        # Lấy pixels thuộc sản phẩm trong vùng tìm kiếm
-        search_mask = std_mask.copy()
-        search_mask[:, search_x:] = 0
-        fg_pixels_idx = np.where(search_mask > 0)
-
+        fg_pixels_idx = np.where(std_mask > 0)
         if len(fg_pixels_idx[0]) < 100:
-            # Quá ít pixel → không đủ dữ liệu
             return 0, 0, 0.0, np.zeros((h_std, w_std), dtype=np.uint8), 0.3
 
-        # === K-means trên LAB color space ===
+        # === Phương pháp 1: HSV range cho đồng ===
+        # Đồng có Hue 5-20 (cam/nâu), Saturation > 100 (rõ ràng), Value 50-180
+        hsv = cv2.cvtColor(standardized, cv2.COLOR_BGR2HSV)
+        copper_lower = np.array([5, 100, 50])
+        copper_upper = np.array([20, 255, 180])
+        copper_mask_hsv = cv2.inRange(hsv, copper_lower, copper_upper)
+        copper_mask_hsv = cv2.bitwise_and(copper_mask_hsv, std_mask)
+
+        # === Phương pháp 2: LAB range cho đồng ===
+        # Đồng có a > 140 (đỏ rõ), b > 140 (vàng), L trung bình 30-150
         lab = cv2.cvtColor(standardized, cv2.COLOR_BGR2LAB)
         fg_lab = lab[fg_pixels_idx[0], fg_pixels_idx[1]]
-
-        n_clusters = min(self.copper_kmeans_clusters, len(fg_lab) // 10)
-        n_clusters = max(2, n_clusters)
-
-        kmeans = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=3, batch_size=256)
-        labels = kmeans.fit_predict(fg_lab)
-        centers = kmeans.cluster_centers_
-
-        # Tìm cluster có đặc tính đồng: kênh a (LAB) cao nhất = màu đỏ/cam
-        # Đồng có a_channel cao (hướng đỏ) và b_channel dương (hướng vàng)
-        copper_scores = []
-        for i, center in enumerate(centers):
-            l_val, a_val, b_val = center
-            # Score: ưu tiên a cao (đỏ/cam), b dương (vàng), l trung bình
-            score = a_val * 1.5 + max(b_val - 128, 0) * 0.5 - abs(l_val - 140) * 0.3
-            copper_scores.append(score)
-
-        copper_cluster_idx = np.argmax(copper_scores)
+        lab_copper = ((fg_lab[:, 1] > 140) & (fg_lab[:, 2] > 140) & 
+                      (fg_lab[:, 0] > 30) & (fg_lab[:, 0] < 150))
         copper_mask_lab = np.zeros((h_std, w_std), dtype=np.uint8)
-        copper_pixels = labels == copper_cluster_idx
-        copper_mask_lab[fg_pixels_idx[0][copper_pixels], fg_pixels_idx[1][copper_pixels]] = 255
+        copper_mask_lab[fg_pixels_idx[0][lab_copper], fg_pixels_idx[1][lab_copper]] = 255
 
-        # === Xác nhận bằng HSV ===
-        hsv = cv2.cvtColor(standardized, cv2.COLOR_BGR2HSV)
-        fg_hsv = hsv[fg_pixels_idx[0], fg_pixels_idx[1]]
-        # Đồng: saturation tương đối cao, hue trong vùng cam/đỏ
-        h_ch = fg_hsv[:, 0]
-        s_ch = fg_hsv[:, 1]
-        # Ngưỡng adaptive: dùng percentile thay vì giá trị cố định
-        s_threshold = max(np.percentile(s_ch, 70), 80)
-        hsv_copper = ((s_ch > s_threshold) & ((h_ch < 30) | (h_ch > 160))).astype(np.uint8) * 255
-        copper_mask_hsv = np.zeros((h_std, w_std), dtype=np.uint8)
-        copper_mask_hsv[fg_pixels_idx[0], fg_pixels_idx[1]] = hsv_copper
-
-        # === Xác nhận bằng YCrCb ===
-        ycrcb = cv2.cvtColor(standardized, cv2.COLOR_BGR2YCrCb)
-        fg_ycrcb = ycrcb[fg_pixels_idx[0], fg_pixels_idx[1]]
-        cr_ch = fg_ycrcb[:, 1]
-        # Đồng: Cr (red chroma) cao
-        cr_threshold = max(np.percentile(cr_ch, 75), 140)
-        ycrcb_copper = (cr_ch > cr_threshold).astype(np.uint8) * 255
-        copper_mask_ycrcb = np.zeros((h_std, w_std), dtype=np.uint8)
-        copper_mask_ycrcb[fg_pixels_idx[0], fg_pixels_idx[1]] = ycrcb_copper
-
-        # === Multi-colorspace fusion: ít nhất 2/3 color space đồng ý ===
-        vote_sum = (copper_mask_lab.astype(np.float32) / 255.0 +
-                    copper_mask_hsv.astype(np.float32) / 255.0 +
-                    copper_mask_ycrcb.astype(np.float32) / 255.0)
-        copper_mask = (vote_sum >= 2.0).astype(np.uint8) * 255
+        # === Fusion: dùng OR (vì cả 2 phương pháp đều tight) ===
+        copper_mask = cv2.bitwise_or(copper_mask_hsv, copper_mask_lab)
 
         # Morphological cleanup
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        copper_mask = cv2.morphologyEx(copper_mask, cv2.MORPH_CLOSE, k, iterations=2)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        copper_mask = cv2.morphologyEx(copper_mask, cv2.MORPH_CLOSE, k, iterations=1)
         copper_mask = cv2.morphologyEx(copper_mask, cv2.MORPH_OPEN, k)
 
         # Connected component analysis: giữ chỉ các component lớn
@@ -667,7 +673,7 @@ class ImageProcessor:
         )
         min_component_area = 30
         clean_mask = np.zeros_like(copper_mask)
-        for i in range(1, num_labels):  # Bỏ qua background (label 0)
+        for i in range(1, num_labels):
             if stats[i, cv2.CC_STAT_AREA] > min_component_area:
                 clean_mask[labels_cc == i] = 255
         copper_mask = clean_mask
@@ -688,7 +694,7 @@ class ImageProcessor:
         self._last_copper_y = c_y
 
         copper_pixels_count = np.sum(copper_mask > 0)
-        total_pixels = max(np.sum(search_mask > 0), 1)
+        total_pixels = max(np.sum(std_mask > 0), 1)
         copper_ratio = copper_pixels_count / total_pixels
 
         # Confidence: dựa trên số pixel đồng phát hiện được
@@ -736,10 +742,11 @@ class ImageProcessor:
         if roi_raw.size == 0:
             return None, 0.0
 
-        # Tính tỷ lệ diện tích đồng trên diện tích sản phẩm (foreground) trong ROI
-        roi_copper_pixels = np.sum(roi_copper_mask > 0)
-        roi_total_pixels = max(np.sum(roi_std_mask > 0), 1)
-        copper_ratio = float(roi_copper_pixels / roi_total_pixels)
+        # Tính tỷ lệ diện tích đồng trên toàn bộ diện tích sản phẩm (foreground) trong ảnh chuẩn hóa
+        # Dùng full std_mask thay vì ROI mask để tránh tỷ lệ bị phóng đại
+        total_copper_pixels = np.sum(copper_mask > 0)
+        total_product_pixels = max(np.sum(std_mask > 0), 1)
+        copper_ratio = float(total_copper_pixels / total_product_pixels)
 
         return cv2.resize(roi_raw, self.target_size, interpolation=cv2.INTER_CUBIC), copper_ratio
 

@@ -68,7 +68,7 @@ CROP_RATIO = 0.45
 MIN_CONTOUR_RATIO = 0.02
 
 # Số cluster cho K-means khi phát hiện đồng lộ
-COPPER_KMEANS_CLUSTERS = 4
+COPPER_KMEANS_CLUSTERS = 5
 
 # -------------------------------------------------------------
 # CẤU HÌNH LIVE CAMERA DETECTION (MỚI)
