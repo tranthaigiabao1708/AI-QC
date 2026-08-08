@@ -204,17 +204,17 @@ class QualityInspector:
 
         # 1. Border xanh lá cây ngoài cùng: Bo sát 100% theo dạng thực tế của vật thể sau khi remove background
         if proc_result.smooth_contour is not None:
-            cv2.drawContours(vis_img, [proc_result.smooth_contour], -1, (0, 255, 0), 3)
+            cv2.polylines(vis_img, [proc_result.smooth_contour], True, (0, 255, 0), 3)
         elif proc_result.outer_rect is not None:
             box = cv2.boxPoints(proc_result.outer_rect)
             box = np.intp(box)
-            cv2.drawContours(vis_img, [box], 0, (0, 255, 0), 3)
+            cv2.polylines(vis_img, [box], True, (0, 255, 0), 3)
 
         # 2. Border đen trung tâm: Bo sát 100% đường viền phần kim loại cos (crimp barrel + ring head)
         if proc_result.terminal_contour is not None:
             img_h, img_w = vis_img.shape[:2]
             border_canvas = np.zeros((img_h, img_w), dtype=np.uint8)
-            cv2.drawContours(border_canvas, [proc_result.terminal_contour], -1, 255, 3)
+            cv2.polylines(border_canvas, [proc_result.terminal_contour], True, 255, 3)
             if hasattr(proc_result, 'metal_end_y') and proc_result.metal_end_y > 0:
                 border_canvas[proc_result.metal_end_y - 2:, :] = 0
             vis_img[border_canvas > 0] = (0, 0, 0)

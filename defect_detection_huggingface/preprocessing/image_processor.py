@@ -289,34 +289,41 @@ class ImageProcessor:
             #    - Dark Warm Copper 1: RGBA (125, 119, 101)
             #    - Dark Tarnished Copper 2: RGBA (62, 57, 40)
             #    - Medium Tarnished Copper 3: RGBA (132, 127, 110)
-            #    - Sắc thái ấm đặc trưng: Red vượt trội so với Blue và tương đương/lớn hơn Green (R >= G - 1 và R > B + 4)
+            #    - Ultra Dark Copper Shadow 4: RGBA (65, 65, 60)
+            #    - Deep Dark Copper Shadow 5:  RGBA (19, 18, 4)
+            #    - Dark Tarnished Copper 6:   RGBA (49, 58, 53)
             # 2. Kim loại chung (Sắt + Đồng / Steel + Metallic Sheen):
             #    - LightCyan4: RGB (122, 139, 139) -> #7A8B8B (Phần kim loại có độ tối L < 165)
             #    - Honeydew3/4: RGB (193, 205, 193) -> #C1CDC1 & RGB (131, 139, 131) -> #838B83
+            #    - Steel Metallic Sheen 1: RGBA (125, 142, 135)
+            #    - Steel Metallic Sheen 2: RGBA (135, 150, 146)
+            #    - Dark Steel Shadow 3:    RGBA (52, 63, 59)
             # 3. Phân biệt màu dây nhựa (LightCyan3):
             #    - LightCyan3: RGB (180, 205, 205) -> #B4CDCD (Phần vỏ dây nhựa màu sáng L > 175)
 
-            # Multishade precision copper mask (AntiqueWhite3/4, PeachPuff4, NavajoWhite4, Cornsilk4, RGBA 125/119/101, 62/57/40, 132/127/110)
+            # Multishade precision copper mask (AntiqueWhite3/4, PeachPuff4, NavajoWhite4, Cornsilk4, RGBA 125/119/101, 62/57/40, 132/127/110, 65/65/60, 19/18/4, 49/58/53)
             cop_orange = (H_f >= 2) & (H_f <= 28) & (S_f > 30) & (V_f > 40) & (V_f < 230)
-            cop_warm = (bg_fg_mask > 0) & (A_f >= 122) & (B_f >= 119) & (R_f >= G_f - 1) & (R_f > B_f + 4) & (S_f > 10) & (L_f > 15) & (L_f < 190)
+            cop_warm = (bg_fg_mask > 0) & (A_f >= 118) & (B_f >= 118) & (R_f >= G_f - 10) & (R_f > B_f - 6) & (S_f > 5) & (L_f > 10) & (L_f < 190)
             copper_raw = ((cop_orange | cop_warm) & (bg_fg_mask > 0)).astype(np.uint8) * 255
 
             # Exclude stamped ring head text reflections (top 15% of product)
             copper_raw[:y_bb + int(h_bb * 0.15), :] = 0
 
             # Scan top-down to dynamically locate start of white/LightCyan3 wire insulation body
+            # Start scanning from 40% of product height to avoid neck glare false positives
             is_wire_insulation = (bg_fg_mask > 0) & (
                 ((L_f > 175) & (G_f > 160) & (B_f > 160) & (S_f < 35)) |
                 ((L_f > 195) & (S_f < 20))
             )
             metal_end_y = y_bb + h_bb
 
-            for r in range(y_bb + int(h_bb * 0.20), y_bb + int(h_bb * 0.85)):
+            scan_start_y = y_bb + int(h_bb * 0.38)
+            for r in range(scan_start_y, y_bb + int(h_bb * 0.88)):
                 row_p = np.sum(bg_fg_mask[r, :] > 0)
                 row_w = np.sum(is_wire_insulation[r, :] > 0)
-                if row_p > 0 and (row_w / row_p) > 0.50:
-                    ratios = [np.sum(is_wire_insulation[fr, :] > 0)/np.sum(bg_fg_mask[fr, :] > 0) for fr in range(r, min(r + 20, y_bb + h_bb)) if np.sum(bg_fg_mask[fr, :] > 0) > 0]
-                    if len(ratios) >= 12 and np.mean(ratios) > 0.50:
+                if row_p > 0 and (row_w / row_p) > 0.55:
+                    ratios = [np.sum(is_wire_insulation[fr, :] > 0)/np.sum(bg_fg_mask[fr, :] > 0) for fr in range(r, min(r + 25, y_bb + h_bb)) if np.sum(bg_fg_mask[fr, :] > 0) > 0]
+                    if len(ratios) >= 15 and np.mean(ratios) > 0.55:
                         metal_end_y = r
                         break
 
@@ -331,9 +338,9 @@ class ImageProcessor:
                     metal_end_y = max_cop_y + 2
 
             metal_mask = np.zeros((h, w), dtype=np.uint8)
-            metal_mask[y_bb:metal_end_y, :] = (bg_fg_mask[y_bb:metal_end_y, :] > 0) & (~is_wire_insulation[y_bb:metal_end_y, :])
+            metal_mask[y_bb:metal_end_y, :] = (bg_fg_mask[y_bb:metal_end_y, :] > 0).astype(np.uint8)
 
-            temp_m = cv2.morphologyEx(metal_mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+            temp_m = cv2.morphologyEx(metal_mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21)))
             m_cnts, _ = cv2.findContours(temp_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
             valid_m = [c for c in m_cnts if cv2.contourArea(c) > 500]
 
