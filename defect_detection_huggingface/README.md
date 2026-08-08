@@ -71,7 +71,7 @@ py live_inspector.py --camera 0 --fps 20 --mode continuous
 # Tự động chụp khi sản phẩm ổn định (cho dây chuyền)
 py live_inspector.py --camera 0 --mode auto-capture
 
-# Preview live, nhấn Space để trigger phân tích (kiểm tra thủ công)
+# Preview live, nhấn '>', SPACE hoặc ENTER để chụp & phân tích (kiểm tra thủ công)
 py live_inspector.py --camera 0 --mode manual-trigger
 ```
 
@@ -88,7 +88,7 @@ py live_inspector.py --camera 1 --resolution 800x600 --fps 15
 |------|-----------|
 | `q` | Thoát |
 | `s` | Chụp screenshot |
-| `Space` | Manual trigger (chế độ manual-trigger) |
+| `>` / `.` / `Space` / `Enter` / `c` | Manual trigger: Chụp ảnh & hiển thị kết quả predictions (chế độ manual-trigger) |
 | `m` | Chuyển đổi chế độ hoạt động |
 
 ### 3 Chế Độ Hoạt Động

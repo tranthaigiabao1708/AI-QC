@@ -529,7 +529,7 @@ class LiveInspector:
                         result = self.last_result
 
                 elif self.mode == "manual-trigger":
-                    # Luôn chạy detect nhanh cho preview, full pipeline chỉ khi trigger
+                    # Luôn chạy preview live camera frame, full pipeline khi người dùng trigger '>' / Space / Enter
                     if self._manual_trigger:
                         result = self.inspector.inspect(frame)
                         self.last_result = result
@@ -540,7 +540,19 @@ class LiveInspector:
                             self._update_stats(result["decision"])
                             if "NG" in str(result["decision"]):
                                 self._save_ng_capture(frame, result)
-                            logger.info(f"Manual trigger: {result['decision']} ({result['confidence']:.1%})")
+
+                            # Hiển thị trực tiếp cửa sổ kết quả predictions sắc nét (vis_img)
+                            if "vis_img" in result and result["vis_img"] is not None:
+                                pred_win = "PREDICTION RESULT (Manual Trigger)"
+                                cv2.namedWindow(pred_win, cv2.WINDOW_NORMAL)
+                                cv2.imshow(pred_win, result["vis_img"])
+
+                                # Lưu kết quả suy luận vào output/predictions
+                                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                pred_path = Path("output/predictions") / f"pred_live_manual_{ts}.jpg"
+                                pred_path.parent.mkdir(parents=True, exist_ok=True)
+                                cv2.imwrite(str(pred_path), result["vis_img"])
+                                logger.info(f"⚡ [MANUAL TRIGGER SUCCESS] QC Result: {result['decision']} ({result['confidence']:.1%}) | Đã lưu: {pred_path}")
                     else:
                         result = self.last_result
 
@@ -564,6 +576,13 @@ class LiveInspector:
                     self.stats, smoother_decision, smoother_conf
                 )
 
+                # Hiển thị hướng dẫn phím bấm ở chế độ manual-trigger
+                if self.mode == "manual-trigger":
+                    banner_text = "MANUAL TRIGGER: An '>' hoac SPACE hoac ENTER de Chup & Predict"
+                    cv2.rectangle(display, (10, h - 50), (w - 10, h - 20), (40, 40, 40), -1)
+                    cv2.putText(display, banner_text, (20, h - 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+
                 cv2.imshow(window_name, display)
 
                 # === Xử lý phím tắt ===
@@ -580,9 +599,10 @@ class LiveInspector:
                     cv2.imwrite(str(screenshot_path), display)
                     logger.info(f"Screenshot đã lưu: {screenshot_path}")
 
-                elif key == ord(' '):
-                    # Manual trigger
+                elif key in (ord('>'), ord('.'), ord(' '), ord('c'), ord('C'), 13, 10):
+                    # Manual trigger bằng phím '>', '.', Space, 'c', Enter
                     self._manual_trigger = True
+                    logger.info("-> Tín hiệu Manual Trigger! Bắt đầu chụp & tính toán predictions...")
 
                 elif key == ord('m'):
                     # Chuyển đổi chế độ
@@ -641,18 +661,25 @@ Phím tắt khi chạy:
                         help=f"FPS mục tiêu (mặc định: {config.TARGET_FPS})")
     parser.add_argument("--resolution", type=parse_resolution, default=None,
                         help=f"Resolution WxH (mặc định: {config.LIVE_RESOLUTION[0]}x{config.LIVE_RESOLUTION[1]})")
-    parser.add_argument("--mode", type=str, choices=LiveInspector.MODES, default="continuous",
-                        help="Chế độ hoạt động (mặc định: continuous)")
+    parser.add_argument("--mode", type=str, default="continuous",
+                        help="Chế độ hoạt động: 'continuous', 'auto-capture', 'manual-trigger' (hoặc 'manual')")
     parser.add_argument("--save-dir", type=str, default=None,
                         help="Thư mục lưu ảnh NG/screenshots")
 
     args = parser.parse_args()
+    
+    mode = args.mode.lower()
+    if mode in ["manual", "manual-trigger"]:
+        mode = "manual-trigger"
+    elif mode not in LiveInspector.MODES:
+        logger.warning(f"Chế độ '{args.mode}' không hợp lệ. Sử dụng 'continuous'.")
+        mode = "continuous"
 
     live = LiveInspector(
         camera_id=args.camera,
         target_fps=args.fps,
         resolution=args.resolution,
-        mode=args.mode,
+        mode=mode,
         save_dir=args.save_dir,
     )
     live.run()
