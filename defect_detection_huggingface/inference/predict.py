@@ -219,8 +219,11 @@ class QualityInspector:
             tx1, ty1, tx2, ty2 = proc_result.terminal_bbox
             cv2.rectangle(vis_img, (tx1, ty1), (tx2, ty2), (0, 0, 0), 3)
 
-        # 3. Khung trong cùng (Xanh lá / Đỏ): Bao quanh dải đồng lộ ra ở khớp nối
-        if proc_result.copper_pts is not None:
+        # 3. Khung trong cùng (Xanh lá / Đỏ): Bao quanh tất cả dải đồng lộ ra ở cả 2 vị trí (ở giữa và ở dưới cùng phần kim loại)
+        if proc_result.copper_boxes:
+            for (c_x, c_y, c_w, c_h) in proc_result.copper_boxes:
+                cv2.rectangle(vis_img, (c_x, c_y), (c_x + c_w, c_y + c_h), color, 2)
+        elif proc_result.copper_pts is not None:
             cv2.drawContours(vis_img, [proc_result.copper_pts], 0, color, 2)
         elif proc_result.copper_bbox_orig is not None:
             cx1, cy1, cx2, cy2 = proc_result.copper_bbox_orig

@@ -50,6 +50,7 @@ class ProcessingResult:
     copper_pts: Optional[np.ndarray] = None    # (4, 2) Đỉnh khung xanh xoay (vùng đồng)
     smooth_contour: Optional[np.ndarray] = None # Contour bo sát toàn bộ sản phẩm sau tách nền
     terminal_contour: Optional[np.ndarray] = None # Contour bo sát phần kim loại (sắt + đồng)
+    copper_boxes: List[Tuple[int, int, int, int]] = field(default_factory=list) # Danh sách (x, y, w, h) các dải đồng phát hiện được (ở giữa & ở dưới)
 
     # Ảnh trực quan hóa từng bước
     vis_steps: Dict[str, np.ndarray] = field(default_factory=dict)
@@ -283,6 +284,40 @@ class ImageProcessor:
             if valid_m:
                 terminal_contour = max(valid_m, key=cv2.contourArea)
 
+        # Nhận diện tất cả các dải lõi đồng lộ (ở cả 2 phía: ở giữa và ở dưới cùng phần kim loại)
+        copper_boxes = []
+        if bg_fg_mask is not None and product_contour is not None:
+            img_fg = cv2.bitwise_and(img_in, img_in, mask=bg_fg_mask)
+            lab_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2LAB)
+            hsv_fg = cv2.cvtColor(img_fg, cv2.COLOR_BGR2HSV)
+
+            L_f = lab_fg[:, :, 0]
+            A_f = lab_fg[:, :, 1]
+            B_f = lab_fg[:, :, 2]
+            H_f = hsv_fg[:, :, 0]
+            S_f = hsv_fg[:, :, 1]
+            V_f = hsv_fg[:, :, 2]
+
+            copper_hsv = (H_f >= 2) & (H_f <= 28) & (S_f > 30) & (V_f < 230)
+            copper_greyed = (A_f >= 123) & (A_f > B_f - 3) & (L_f < 165) & (S_f > 12) & (bg_fg_mask > 0)
+            copper_comb = ((copper_hsv | copper_greyed) & (bg_fg_mask > 0)).astype(np.uint8) * 255
+
+            x_bb, y_bb, w_bb, h_bb = cv2.boundingRect(product_contour)
+            copper_comb[y_bb + int(h_bb * 0.42):, :] = 0
+            copper_comb[:y_bb, :] = 0
+
+            k_cop = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 3))
+            copper_cleaned = cv2.morphologyEx(copper_comb, cv2.MORPH_CLOSE, k_cop, iterations=2)
+
+            cop_cnts, _ = cv2.findContours(copper_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c_c in cop_cnts:
+                if cv2.contourArea(c_c) > 8:
+                    cx_c, cy_c, cw_c, ch_c = cv2.boundingRect(c_c)
+                    margin_x = int(cw_c * 0.15) + 2
+                    cx_f = max(0, cx_c - margin_x)
+                    cw_f = cw_c + margin_x * 2
+                    copper_boxes.append((cx_f, cy_c, cw_f, ch_c))
+
         # Tính pipeline confidence tổng thể
         pipeline_confidence = float(np.mean(confidence_scores)) if confidence_scores else 0.5
 
@@ -307,6 +342,7 @@ class ImageProcessor:
             copper_pts=copper_pts,
             smooth_contour=smooth_contour,
             terminal_contour=terminal_contour,
+            copper_boxes=copper_boxes,
             vis_steps=vis,
         )
 
