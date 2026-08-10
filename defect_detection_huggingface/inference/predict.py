@@ -72,13 +72,17 @@ class QualityInspector:
             self.model.eval()
             self.has_trained_model = False
 
-        # Khởi tạo OpenCV Image Processor (phiên bản robust V2)
+        # Khởi tạo OpenCV Image Processor (phiên bản robust V2 + YOLO-seg)
         self.opencv_processor = ImageProcessor(
             target_size=config.IMAGE_SIZE,
             crop_ratio=getattr(config, 'CROP_RATIO', 0.45),
             fixed_crop_length=config.FIXED_CROP_LENGTH,
             min_contour_ratio=getattr(config, 'MIN_CONTOUR_RATIO', 0.02),
             copper_kmeans_clusters=getattr(config, 'COPPER_KMEANS_CLUSTERS', 4),
+            enable_presharpening=getattr(config, 'ENABLE_PRESHARPENING', False),
+            use_yolo_seg=getattr(config, 'USE_YOLO_SEG', False),
+            yolo_model_path=getattr(config, 'YOLO_SEG_MODEL_PATH', None),
+            yolo_confidence=getattr(config, 'YOLO_SEG_CONFIDENCE', 0.5),
         )
         mode_str = "CV+AI" if self.has_trained_model else "CV-only (model chưa train)"
         logger.info(f"Khởi tạo QualityInspector V3 thành công! Mode: {mode_str}")

@@ -27,6 +27,14 @@ except ImportError:
     except ImportError:
         ProductDetector = None
 
+try:
+    from preprocessing.yolo_segmentor import YOLOSegmentor
+except ImportError:
+    try:
+        from yolo_segmentor import YOLOSegmentor
+    except ImportError:
+        YOLOSegmentor = None
+
 
 @dataclass
 class ProcessingResult:
@@ -79,6 +87,10 @@ class ImageProcessor:
         search_region_ratio: float = 0.60,
         save_vis_steps: bool = True,
         reference_dir: Optional[str] = None,
+        enable_presharpening: bool = False,
+        use_yolo_seg: bool = False,
+        yolo_model_path: Optional[str] = None,
+        yolo_confidence: float = 0.5,
     ):
         self.target_size = target_size
         self.crop_ratio = crop_ratio
@@ -87,6 +99,25 @@ class ImageProcessor:
         self.copper_kmeans_clusters = copper_kmeans_clusters
         self.search_region_ratio = search_region_ratio
         self.save_vis_steps = save_vis_steps
+        self.enable_presharpening = enable_presharpening
+        self.use_yolo_seg = use_yolo_seg
+
+        # ═══ YOLOv8-seg Segmentor ═══
+        self.yolo_segmentor = None
+        if use_yolo_seg and YOLOSegmentor is not None and yolo_model_path:
+            try:
+                self.yolo_segmentor = YOLOSegmentor(
+                    model_path=yolo_model_path,
+                    confidence_threshold=yolo_confidence
+                )
+                if self.yolo_segmentor.is_ready:
+                    logger.info(f"YOLOv8-seg loaded: {yolo_model_path}")
+                else:
+                    self.yolo_segmentor = None
+                    logger.warning(f"YOLOv8-seg model không tồn tại: {yolo_model_path} — dùng CV fallback")
+            except Exception as e:
+                logger.warning(f"Không load được YOLOv8-seg: {e} — dùng CV fallback")
+                self.yolo_segmentor = None
 
         # Biến lưu trữ kết quả trung gian cho visualization
         self._last_copper_x = 0
@@ -127,9 +158,35 @@ class ImageProcessor:
         vis = {}
         confidence_scores = []  # Thu thập điểm tin cậy từ mỗi bước
 
+        # ═══ BƯỚC 0 (TÙY CHỌN): LÀM NÉT ẢNH TRƯỚC KHI TÁCH NỀN ═══
+        if self.enable_presharpening:
+            img_in = self._presharpen(img_in)
+            if self.save_vis_steps:
+                vis["00_presharpened"] = img_in.copy()
+
         # ═══ BƯỚC 1: PHÁT HIỆN SẢN PHẨM ═══
-        fg_mask, product_contour, conf1 = self._step1_remove_background(img_in, h, w)
-        detection_method = "rule-based"
+        yolo_smooth_contour = None  # Sẽ dùng nếu YOLO detect thành công
+
+        if self.yolo_segmentor is not None and self.yolo_segmentor.is_ready:
+            # Thử dùng YOLO trước
+            fg_mask_yolo, contour_yolo, smooth_yolo, conf_yolo = \
+                self.yolo_segmentor.segment_smooth_contour(img_in)
+            if fg_mask_yolo is not None:
+                fg_mask = fg_mask_yolo
+                product_contour = contour_yolo
+                yolo_smooth_contour = smooth_yolo
+                conf1 = conf_yolo
+                detection_method = f"YOLO-seg ({conf_yolo:.0%})"
+                logger.debug(f"YOLO-seg detect thành công: conf={conf_yolo:.2f}")
+            else:
+                # YOLO fail → fallback CV
+                logger.debug("YOLO-seg không detect được, fallback CV")
+                fg_mask, product_contour, conf1 = self._step1_remove_background(img_in, h, w)
+                detection_method = "rule-based (YOLO fallback)"
+        else:
+            # Không có YOLO → dùng CV truyền thống
+            fg_mask, product_contour, conf1 = self._step1_remove_background(img_in, h, w)
+            detection_method = "rule-based"
 
         if self.detector is not None:
             det_result = self.detector.detect(img_in)
@@ -141,7 +198,8 @@ class ImageProcessor:
                 is_valid_thickness = min_dim > h * 0.05
                 if is_valid_position and is_valid_thickness:
                     conf1 = max(conf1, det_result['confidence'])
-                    detection_method = f"feature-match ({det_result['ref_name']}, {det_result['match_count']} matches)"
+                    if "YOLO" not in detection_method:
+                        detection_method = f"feature-match ({det_result['ref_name']}, {det_result['match_count']} matches)"
 
         confidence_scores.append(conf1)
         if fg_mask is None:
@@ -232,27 +290,51 @@ class ImageProcessor:
         if self.save_vis_steps:
             vis["06_roi_final"] = roi_final.copy()
 
-        # Tạo smooth_contour bo sát 100% đường viền thật của sản phẩm từ mask tách nền LAB
-        bg_fg_mask, _, _ = self._step1_remove_background(img_in, h, w)
-        smooth_contour = None
-        if bg_fg_mask is not None:
-            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-            cleaned_m = cv2.morphologyEx(bg_fg_mask, cv2.MORPH_CLOSE, k_close, iterations=3)
-            cleaned_m = cv2.morphologyEx(cleaned_m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+        # Tạo smooth_contour bo sát 100% đường viền thật của sản phẩm
+        if yolo_smooth_contour is not None:
+            # YOLO đã tạo smooth contour chính xác hơn CV
+            smooth_contour = yolo_smooth_contour
+        else:
+            # Fallback: tạo smooth_contour từ pipeline CV
+            bg_fg_mask, _, _ = self._step1_remove_background(img_in, h, w)
+            smooth_contour = None
+            if bg_fg_mask is not None:
+                k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                cleaned_m = cv2.morphologyEx(bg_fg_mask, cv2.MORPH_CLOSE, k_close, iterations=3)
+                # Giảm kernel MORPH_OPEN (7→3) để giữ lại phần ring head nhỏ
+                cleaned_m = cv2.morphologyEx(cleaned_m, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
-            blurred_mask = cv2.GaussianBlur(cleaned_m, (21, 21), 0)
-            _, th_smooth = cv2.threshold(blurred_mask, 120, 255, cv2.THRESH_BINARY)
-            cnts_smooth, _ = cv2.findContours(th_smooth, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-            valid_sm = [c for c in cnts_smooth if cv2.contourArea(c) > 10000 and (0.2*w <= (cv2.boundingRect(c)[0]+cv2.boundingRect(c)[2]/2) <= 0.8*w)]
-            if valid_sm:
-                c_best_sm = max(valid_sm, key=cv2.contourArea)
-                epsilon = 0.001 * cv2.arcLength(c_best_sm, True)
-                smooth_contour = cv2.approxPolyDP(c_best_sm, epsilon, True)
+                # Dilate nhẹ trước blur để bù lại phần biên bị mất khi blur + threshold
+                k_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                dilated_m = cv2.dilate(cleaned_m, k_dilate, iterations=1)
+
+                # Giảm GaussianBlur kernel (21→11) và threshold (120→80) để không co mất biên ring head
+                blurred_mask = cv2.GaussianBlur(dilated_m, (11, 11), 0)
+                _, th_smooth = cv2.threshold(blurred_mask, 80, 255, cv2.THRESH_BINARY)
+                cnts_smooth, _ = cv2.findContours(th_smooth, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                valid_sm = [c for c in cnts_smooth if cv2.contourArea(c) > 10000 and (0.2*w <= (cv2.boundingRect(c)[0]+cv2.boundingRect(c)[2]/2) <= 0.8*w)]
+                if valid_sm:
+                    c_best_sm = max(valid_sm, key=cv2.contourArea)
+                    epsilon = 0.001 * cv2.arcLength(c_best_sm, True)
+                    smooth_contour = cv2.approxPolyDP(c_best_sm, epsilon, True)
 
         # ── DYNAMIC METALLIC BORDER (TERMINAL_CONTOUR) & MULTI-LOCATION COPPER ──
         terminal_contour = None
         copper_boxes = []
         copper_details = []
+
+        # Xác định bg_fg_mask cho phần terminal_contour bên dưới
+        if yolo_smooth_contour is not None:
+            # YOLO đã cung cấp mask — dùng fg_mask trực tiếp
+            bg_fg_mask = fg_mask
+            k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+            cleaned_m = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, k_close, iterations=3)
+            cleaned_m = cv2.morphologyEx(cleaned_m, cv2.MORPH_OPEN,
+                                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        elif 'bg_fg_mask' not in locals():
+            # Fallback nếu smooth_contour cũng không tạo bg_fg_mask
+            bg_fg_mask = None
+            cleaned_m = None
 
         if bg_fg_mask is not None:
             cnts_full, _ = cv2.findContours(cleaned_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -279,53 +361,48 @@ class ImageProcessor:
             G_f = rgb_fg[:, :, 1].astype(int)
             B_f = rgb_fg[:, :, 2].astype(int)
 
-            # ── QUY CHUẨN MÀU SẮC THEO YÊU CẦU ──
-            # 1. Màu đồng (Copper Palette):
-            #    - AntiqueWhite3: RGB (205, 192, 176) -> #CDC0B0
-            #    - AntiqueWhite4: RGB (139, 131, 120) -> #8B8378
-            #    - PeachPuff4:    RGB (139, 119, 101) -> #8B7765
-            #    - NavajoWhite4:  RGB (139, 121, 94)  -> #8B795E
-            #    - Cornsilk4:     RGB (139, 136, 120) -> #8B8878 (Phổ màu củ đồng tản nhiệt/tarnished)
-            #    - Dark Warm Copper 1: RGBA (125, 119, 101)
-            #    - Dark Tarnished Copper 2: RGBA (62, 57, 40)
-            #    - Medium Tarnished Copper 3: RGBA (132, 127, 110)
-            #    - Ultra Dark Copper Shadow 4: RGBA (65, 65, 60)
-            #    - Deep Dark Copper Shadow 5:  RGBA (19, 18, 4)
-            #    - Dark Tarnished Copper 6:   RGBA (49, 58, 53)
-            # 2. Kim loại chung (Sắt + Đồng / Steel + Metallic Sheen):
-            #    - LightCyan4: RGB (122, 139, 139) -> #7A8B8B (Phần kim loại có độ tối L < 165)
-            #    - Honeydew3/4: RGB (193, 205, 193) -> #C1CDC1 & RGB (131, 139, 131) -> #838B83
-            #    - Steel Metallic Sheen 1: RGBA (125, 142, 135)
-            #    - Steel Metallic Sheen 2: RGBA (135, 150, 146)
-            #    - Dark Steel Shadow 3:    RGBA (52, 63, 59)
-            # 3. Phân biệt màu dây nhựa (LightCyan3):
-            #    - LightCyan3: RGB (180, 205, 205) -> #B4CDCD (Phần vỏ dây nhựa màu sáng L > 175)
+            # ── QUY CHUẨN MÀU SẮC & ADAPTIVE SAMPLING THEO YÊU CẦU ──
+            # 1. Adaptive Wire Insulation Sampling (Nửa dưới 65-88% luôn là vỏ dây nhựa)
+            y1_w, y2_w = y_bb + int(h_bb * 0.65), y_bb + int(h_bb * 0.88)
+            wire_sample_mask = np.zeros((h, w), dtype=bool)
+            wire_sample_mask[y1_w:y2_w, :] = (bg_fg_mask[y1_w:y2_w, :] > 0)
+            
+            if np.sum(wire_sample_mask) > 10:
+                L_wire_med = float(np.median(L_f[wire_sample_mask]))
+                S_wire_med = float(np.median(S_f[wire_sample_mask]))
+            else:
+                L_wire_med, S_wire_med = 180.0, 20.0
 
-            # Multishade precision copper mask (AntiqueWhite3/4, PeachPuff4, NavajoWhite4, Cornsilk4, RGBA 125/119/101, 62/57/40, 132/127/110, 65/65/60, 19/18/4, 49/58/53)
-            cop_orange = (H_f >= 2) & (H_f <= 28) & (S_f > 30) & (V_f > 40) & (V_f < 230)
-            cop_warm = (bg_fg_mask > 0) & (A_f >= 118) & (B_f >= 118) & (R_f >= G_f - 10) & (R_f > B_f - 6) & (S_f > 5) & (L_f > 10) & (L_f < 190)
-            copper_raw = ((cop_orange | cop_warm) & (bg_fg_mask > 0)).astype(np.uint8) * 255
-
-            # Exclude stamped ring head text reflections (top 15% of product)
-            copper_raw[:y_bb + int(h_bb * 0.15), :] = 0
-
-            # Scan top-down to dynamically locate start of white/LightCyan3 wire insulation body
-            # Start scanning from 40% of product height to avoid neck glare false positives
+            # Phân biệt màu dây nhựa (cố định + tự thích ứng độ sáng)
             is_wire_insulation = (bg_fg_mask > 0) & (
                 ((L_f > 175) & (G_f > 160) & (B_f > 160) & (S_f < 35)) |
-                ((L_f > 195) & (S_f < 20))
+                ((L_f > 195) & (S_f < 20)) |
+                ((np.abs(L_f.astype(float) - L_wire_med) < 40) & (S_f <= max(S_wire_med + 25, 45)))
             )
-            metal_end_y = y_bb + h_bb
 
-            scan_start_y = y_bb + int(h_bb * 0.38)
+            # Scan top-down tìm vị trí bắt đầu vỏ dây nhựa (metal_end_y)
+            scan_start_y = y_bb + int(h_bb * 0.35)
+            metal_end_y = y_bb + int(h_bb * 0.50)  # Fallback mặc định là 50% sản phẩm nếu không tìm thấy ranh giới
+
             for r in range(scan_start_y, y_bb + int(h_bb * 0.88)):
                 row_p = np.sum(bg_fg_mask[r, :] > 0)
                 row_w = np.sum(is_wire_insulation[r, :] > 0)
-                if row_p > 0 and (row_w / row_p) > 0.55:
-                    ratios = [np.sum(is_wire_insulation[fr, :] > 0)/np.sum(bg_fg_mask[fr, :] > 0) for fr in range(r, min(r + 25, y_bb + h_bb)) if np.sum(bg_fg_mask[fr, :] > 0) > 0]
-                    if len(ratios) >= 15 and np.mean(ratios) > 0.55:
+                if row_p > 0 and (row_w / row_p) > 0.45:
+                    ratios = [np.sum(is_wire_insulation[fr, :] > 0)/np.sum(bg_fg_mask[fr, :] > 0) 
+                              for fr in range(r, min(r + 20, y_bb + h_bb)) if np.sum(bg_fg_mask[fr, :] > 0) > 0]
+                    if len(ratios) >= 10 and np.mean(ratios) > 0.45:
                         metal_end_y = r
                         break
+
+            # Multishade & Relative Copper Mask (Hỗ trợ cả ảnh sáng, ảnh tối br_dark, tương phản cao)
+            cop_orange = (H_f >= 2) & (H_f <= 30) & (S_f > 20) & (V_f > 25)
+            cop_warm = (bg_fg_mask > 0) & (A_f >= 127) & (B_f >= 127) & (R_f >= G_f - 2) & (R_f > B_f - 4) & (S_f > 8)
+            cop_relative = (bg_fg_mask > 0) & (R_f > G_f + 3) & (R_f > B_f + 4) & (S_f > 10)
+            
+            copper_raw = ((cop_orange | cop_warm | cop_relative) & (bg_fg_mask > 0)).astype(np.uint8) * 255
+
+            # Exclude stamped ring head text reflections (top 15% of product)
+            copper_raw[:y_bb + int(h_bb * 0.15), :] = 0
 
             # Zero out any copper detected below metal_end_y + 10 in wire body
             copper_raw[metal_end_y + 10:, :] = 0
@@ -1056,3 +1133,15 @@ class ImageProcessor:
             return 0.0
 
         return float(np.mean(fg_pixels))
+
+    @staticmethod
+    def _presharpen(img_bgr):
+        """
+        Làm nét ảnh trước khi tách nền (Unsharp Mask).
+        Tăng edge contrast giữa sản phẩm và nền → cải thiện contour detection.
+        Sử dụng tham số bảo thủ để tránh amplify noise.
+        """
+        # Unsharp Mask: sharpened = original + alpha * (original - blurred)
+        blurred = cv2.GaussianBlur(img_bgr, (0, 0), sigmaX=3)
+        sharpened = cv2.addWeighted(img_bgr, 1.5, blurred, -0.5, 0)
+        return sharpened

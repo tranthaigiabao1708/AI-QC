@@ -70,6 +70,14 @@ MIN_CONTOUR_RATIO = 0.02
 # Số cluster cho K-means khi phát hiện đồng lộ
 COPPER_KMEANS_CLUSTERS = 5
 
+# Bật/tắt bước làm nét ảnh trước khi tách nền (cải thiện edge detection)
+ENABLE_PRESHARPENING = True
+
+# YOLOv8-seg: Bật để dùng AI detect sản phẩm thay vì pipeline CV rule-based
+USE_YOLO_SEG = True
+YOLO_SEG_MODEL_PATH = str(OUTPUT_DIR / "yolo_seg_best.pt")
+YOLO_SEG_CONFIDENCE = 0.5
+
 # -------------------------------------------------------------
 # CẤU HÌNH LIVE CAMERA DETECTION (MỚI)
 # -------------------------------------------------------------

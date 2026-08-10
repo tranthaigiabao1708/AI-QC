@@ -1,0 +1,30 @@
+# Python & Environment
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Output predictions & test logs
+output/predictions/
+output/pipeline_test_report.csv
+output/yolo_seg_model/
+streamlit_debug.log
+
+# Generated test & training datasets
+data/augmented_test/
+data/yolo_dataset/
+*.cache
+
+# Pretrained weights download
+yolov8n-seg.pt
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
